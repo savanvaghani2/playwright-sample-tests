@@ -22,7 +22,7 @@ export default defineConfig({
     ['blob', { outputDir: 'blob-report' }], // Blob reporter for merging
     ['json', { outputFile: './playwright-report/report.json' }],
     ['@testdino/playwright', {
-      token: "trx_development_75eba63f6e84becfb5ea4fdbf70a2a3bc5b05d4b52edf443a6b51ad643eeedc5",
+      token: "trx_development_2b794cc352ae8928e1526fe731d3d87a982130b9983f6a8c80afdbcbd56e9663",
       serverUrl: "https://railwayless-iris-ebulliently.ngrok-free.app",
       debug: false,
       artifacts: false
