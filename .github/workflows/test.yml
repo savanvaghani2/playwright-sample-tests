@@ -38,8 +38,15 @@ jobs:
       # including the ngrok tunnel for `local`, which a runner cannot reach
       # otherwise. dotenv never overrides a variable already in the environment,
       # so this wins over any .env the job writes.
-      TD_ENV: ${{ inputs.td_env || 'staging' }}
-      TESTDINO_TOKEN: ${{ inputs.td_env == 'local' && secrets.TESTDINO_TOKEN_LOCAL || secrets.TESTDINO_TOKEN }}
+      # A dashboard-dispatched re-run carries no td_env — the integration service
+      # only sends the two rerun inputs — so it would silently land on staging.
+      # While the dashboard doing the dispatching is the local one, a re-run means
+      # local. Drop this clause once the dispatcher names its own server.
+      TD_ENV: ${{ inputs.td_env || (inputs.testdino_rerun_of != '' && 'local') || 'staging' }}
+      # Must mirror the TD_ENV condition above exactly — GitHub cannot reference
+      # one env value from another, and a token from the wrong environment is a
+      # 401 rather than a visible misconfiguration.
+      TESTDINO_TOKEN: ${{ (inputs.td_env == 'local' || (inputs.td_env == '' && inputs.testdino_rerun_of != '')) && secrets.TESTDINO_TOKEN_LOCAL || secrets.TESTDINO_TOKEN }}
       TESTDINO_CI_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
