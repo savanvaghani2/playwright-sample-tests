@@ -20,7 +20,7 @@ const coverageEnabled = process.env.COVERAGE === 'true';
 const token = isCI
   ? 'td_api_24831a8db96509cbe0ee22033dc98de46246f1f76e6a2a63a101e7d88ae65ad0'
   : // Local  - Savan Team
-    'td_api_6da627f3d1ba734784060a4a2ca2a6bad91e00b8fc644337d6e298648103fcc2';
+    'td_api_de36ca9059cfc62a17d0a0226c2d91b1dcc39c546a1e47cfa4b46b90bb11c6ca';
 
 export default defineConfig({
   testDir: './tests',

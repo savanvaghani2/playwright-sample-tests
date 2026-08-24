@@ -30,7 +30,7 @@
     "vite-plugin-istanbul": "^7.0.12"
   },
   "dependencies": {
-    "@testdino/playwright": "^2.3.0",
+    "@testdino/playwright": "file:temp-cli/testdino-playwright-2.4.0.tgz",
     "playwright": "^1.55.0"
   }
 }
