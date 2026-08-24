@@ -1,4 +1,6 @@
-// @ts-check
+// @ts-nocheck
+import 'dotenv/config';
+
 import { defineConfig, devices } from '@playwright/test';
 
 const isCI = !!process.env.CI;
@@ -12,15 +14,46 @@ const ciRunId =
     ? `ci-run-${process.env.GITHUB_RUN_ID}-${process.env.GITHUB_RUN_ATTEMPT || 1}`
     : `local-run-${Date.now()}`);
 
-const serverUrl = isCI ? 'https://stg-analytics.testdino.com' : 'http://localhost:3005';
+// Everything environment-specific hangs off TD_ENV (.env), so switching targets
+// is a one-line edit there and never an edit here. CI has no .env, so it falls
+// back to staging unless the workflow says otherwise.
+// A GitHub runner's localhost is the runner, not your Mac, so a CI job aimed at
+// the local stack has to come back through a tunnel. Reserved ngrok domain by
+// default; override in .env (or as a CI variable) when the tunnel moves.
+const LOCAL_TUNNEL_URL =
+  process.env.TD_LOCAL_TUNNEL_URL || 'https://railwayless-iris-ebulliently.ngrok-free.app';
 
-const artifacts = isCI;
+const SERVER_URLS = {
+  local: isCI ? LOCAL_TUNNEL_URL : 'http://localhost:3005',
+  staging: 'https://stg-analytics.testdino.com',
+  prod: 'https://reporter.testdino.com',
+};
+
+const env = (process.env.TD_ENV || (isCI ? 'staging' : 'local')).toLowerCase();
+if (!SERVER_URLS[env]) {
+  throw new Error(
+    `TD_ENV="${env}" is not one of: ${Object.keys(SERVER_URLS).join(', ')}. Fix it in .env.`,
+  );
+}
+
+// An explicit URL wins so a branch deploy or tunnel needs no new entry above.
+const serverUrl = process.env.TESTDINO_SERVER_URL || SERVER_URLS[env];
+
+// Environment-specific first: a leftover generic TESTDINO_TOKEN must not
+// silently outrank the token that belongs to the selected TD_ENV. TDPW_TOKEN is
+// what the CLI reads, so honouring it keeps CI and this config in agreement.
+const token =
+  process.env[`TESTDINO_TOKEN_${env.toUpperCase()}`] ||
+  process.env.TESTDINO_TOKEN ||
+  process.env.TDPW_TOKEN;
+
+if (!token) {
+  throw new Error(
+    `No TestDino token for TD_ENV=${env}. Set TESTDINO_TOKEN_${env.toUpperCase()} in .env.`,
+  );
+}
+
 const coverageEnabled = process.env.COVERAGE === 'true';
-
-const token = isCI
-  ? 'td_api_24831a8db96509cbe0ee22033dc98de46246f1f76e6a2a63a101e7d88ae65ad0'
-  : // Local  - Savan Team
-    'td_api_de36ca9059cfc62a17d0a0226c2d91b1dcc39c546a1e47cfa4b46b90bb11c6ca';
 
 export default defineConfig({
   testDir: './tests',
@@ -42,9 +75,11 @@ export default defineConfig({
         serverUrl,
         token,
         ciRunId,
-        debug: false,
-        artifacts: false,
-        tags: ['@api', '@local', '@staging', '@chromium'],
+        debug: process.env.TESTDINO_DEBUG === 'true',
+        artifacts: process.env.TESTDINO_ARTIFACTS === 'true',
+        // The env tag is derived, so a run can never be labelled with the
+        // environment it did not report to.
+        tags: ['@api', `@${env}`, '@chromium'],
         ...(coverageEnabled && {
           coverage: {
             enabled: true,
@@ -72,7 +107,7 @@ export default defineConfig({
     : undefined,
 
   use: {
-    baseURL: 'https://storedemo.testdino.com/products',
+    baseURL: process.env.BASE_URL || 'https://storedemo.testdino.com/products',
     headless: true,
     trace: 'on',
     screenshot: 'only-on-failure',
@@ -135,8 +170,3 @@ export default defineConfig({
     },
   ],
 });
-
-
-
-// td_api_0f3173d12c7a90cdc78c7405c6f4fe8c2c42af160a33f3611ba4af15646a83e1 // testdino api token PROD - ayush@testdino.com - Savan Test Org
-// td_api_24831a8db96509cbe0ee22033dc98de46246f1f76e6a2a63a101e7d88ae65ad0 // testdino api token STAGE - krupa.alphabin+1@gmail.com - Savan Test

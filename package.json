@@ -27,7 +27,8 @@
     "@types/node": "^24.1.0",
     "prettier": "3.9.1",
     "vite": "^6.3.5",
-    "vite-plugin-istanbul": "^7.0.12"
+    "vite-plugin-istanbul": "^7.0.12",
+    "dotenv": "^17.4.2"
   },
   "dependencies": {
     "@testdino/playwright": "file:temp-cli/testdino-playwright-2.4.0.tgz",

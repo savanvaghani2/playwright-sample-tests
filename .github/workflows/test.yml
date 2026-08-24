@@ -6,6 +6,18 @@ on:
   schedule:
     - cron: '30 3 * * 1-5'
   workflow_dispatch:
+    inputs:
+      td_env:
+        description: Which TestDino to report to
+        type: choice
+        default: staging
+        options: [staging, prod, local]
+      testdino_rerun_of:
+        description: Source run id, when this run re-runs another run's tests
+        required: false
+      testdino_rerun_args:
+        description: Which of that run's tests (--scope / --test-ids / --exclude-ids)
+        required: false
 
 jobs:
   run-tests:
@@ -22,8 +34,12 @@ jobs:
         shardTotal: [5]
 
     env:
-      TDPW_TOKEN: ${{ secrets.TESTDINO_TOKEN }}
-      TESTDINO_SERVER_URL: https://reporter.testdino.com
+      # TD_ENV is the single switch; playwright.config.js turns it into a URL —
+      # including the ngrok tunnel for `local`, which a runner cannot reach
+      # otherwise. dotenv never overrides a variable already in the environment,
+      # so this wins over any .env the job writes.
+      TD_ENV: ${{ inputs.td_env || 'staging' }}
+      TESTDINO_TOKEN: ${{ inputs.td_env == 'local' && secrets.TESTDINO_TOKEN_LOCAL || secrets.TESTDINO_TOKEN }}
       TESTDINO_CI_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
@@ -52,11 +68,25 @@ jobs:
           npm ci
           npx playwright install --with-deps
 
+      # One place decides the URL: the config. Exporting it here is only so the
+      # CLI's own calls (auth, test selection) agree with the reporter's.
+      - name: Resolve the TestDino server from TD_ENV
+        run: |
+          [ -n "${TESTDINO_TOKEN:-}" ] || { echo "::error::No token for TD_ENV=$TD_ENV"; exit 1; }
+          URL=$(node --input-type=module -e "
+            const m = await import('./playwright.config.js');
+            process.stdout.write(m.default.reporter[0][1].serverUrl);
+          ")
+          echo "Reporting to $URL (TD_ENV=$TD_ENV)"
+          echo "TESTDINO_SERVER_URL=$URL" >> "$GITHUB_ENV"
+
       - name: Run Playwright tests
         run: |
           npx tdpw test \
-            -t "$TDPW_TOKEN" \
-            --server-url "$TESTDINO_SERVER_URL" \
             --ci-run-id "$TESTDINO_CI_RUN_ID" \
             --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }} \
-            --workers=5
+            --workers=5 \
+            ${RERUN_OF:+--last-failed --from-run "$RERUN_OF" $RERUN_ARGS}
+        env:
+          RERUN_OF: ${{ inputs.testdino_rerun_of }}
+          RERUN_ARGS: ${{ inputs.testdino_rerun_args }}
