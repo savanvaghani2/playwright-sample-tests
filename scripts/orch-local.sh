@@ -7,6 +7,7 @@
 #   npm run test:orch             2 machines, chromium+firefox (multi-project)
 #   npm run test:orch:api         3 machines, api project (network-free, wider)
 #   ORCH_MACHINES=4 npm run test:orch
+#   ORCH_WORKERS=1 npm run test:orch:api   serial inside each machine
 #
 # Unlike split mode, the machine does NOT decide what it runs — it waits on the
 # socket and the dispatcher assigns. Legs therefore MUST run in parallel: started
@@ -26,6 +27,10 @@ cd "$(dirname "$0")/.."
 MODE="${ORCH_MODE:-browser}"
 MACHINES="${ORCH_MACHINES:-}"
 OUT="${ORCH_OUT:-.orch-master.json}"
+# Workers is the INTRA-machine axis: one machine runs W tests at once. Unset uses
+# playwright.config.js (5). ORCH_WORKERS=1 is the serial case, which the config
+# cannot express and which nothing else exercises.
+WORKERS="${ORCH_WORKERS:-}"
 
 # `discover` filters by --project/--grep only (it lists the whole testDir), so the
 # spec set is chosen by filter, never by path.
@@ -75,14 +80,22 @@ echo
 echo "orchestration: $ORCH_ID   specs: $SPEC_COUNT   machines: $MACHINES"
 echo
 
+# A plain string, not an array: macOS ships bash 3.2, where expanding an EMPTY
+# array as "${a[@]}" under `set -u` is an unbound-variable error. Unquoted on
+# purpose so empty expands to nothing.
+workers_arg=""
+if [ -n "$WORKERS" ]; then workers_arg="--workers=$WORKERS"; fi
+
 # Every leg in parallel, mirroring a CI matrix. A leg that exits non-zero is not
 # an error here: the suite contains deliberately failing specs.
 pids=()
 for i in $(seq 1 "$MACHINES"); do
   (
+    # shellcheck disable=SC2086
     npx tdpw orchestrate run \
       --orchestration-id "$ORCH_ID" \
       --device-id "m$i" \
+      $workers_arg \
       2>&1 | sed "s/^/[m$i] /"
   ) &
   pids+=("$!")

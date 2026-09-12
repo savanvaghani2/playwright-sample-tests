@@ -57,6 +57,11 @@ on:
         type: choice
         default: "2"
         options: ["2", "3", "4"]
+      workers:
+        description: "Workers PER machine (intra-machine concurrency). config = playwright.config.js (5); 1 = serial inside each machine"
+        type: choice
+        default: "config"
+        options: ["config", "1", "2", "5"]
 
 # Never cancel an orchestration mid-flight. A cancelled machine drops its
 # WebSocket with specs still inflight, which the dispatcher reads as a crash: the
@@ -263,20 +268,26 @@ jobs:
         # the crash/attempt ledger, which is keyed on (spec, machineId).
         env:
           MODE: ${{ inputs.mode }}
+          WORKERS_INPUT: ${{ inputs.workers }}
         run: |
           set -euo pipefail
           # Workers is the INTRA-machine axis: one machine runs W tests at once.
-          # Capped for `all` because 3 machines x 5 workers is 15 concurrent
-          # browsers against the shared demo site, which fails tests for reasons
-          # unrelated to orchestration. 2 still exercises W>1. Harmless that
-          # discover recorded W=5 from the config: under fullyParallel the
-          # dispatcher hands out 1 spec regardless of W, so W only weighted LPT.
+          # An explicit `workers` input wins; otherwise `all` still caps at 2,
+          # because 3 machines x 5 workers is 15 concurrent browsers against the
+          # shared demo site, which fails tests for reasons unrelated to
+          # orchestration. Harmless that discover recorded W=5 from the config:
+          # under fullyParallel the dispatcher hands out 1 spec regardless of W,
+          # so W only weighted LPT.
           # A plain string, not an array: macOS ships bash 3.2, where expanding an
-          # EMPTY array as "${a[@]}" under `set -u` is an unbound-variable error.
-          # Every mode except `all` leaves it empty, which killed both machines
-          # before the CLI ran. Unquoted on purpose so empty expands to nothing.
+          # EMPTY array as "${a[@]}" under `set -u` is an unbound-variable error,
+          # which killed both machines before the CLI ran. Unquoted on purpose so
+          # empty expands to nothing.
           workers_arg=""
-          if [ "$MODE" = "all" ]; then workers_arg="--workers=2"; fi
+          if [ "$WORKERS_INPUT" != "config" ]; then
+            workers_arg="--workers=$WORKERS_INPUT"
+          elif [ "$MODE" = "all" ]; then
+            workers_arg="--workers=2"
+          fi
 
           # shellcheck disable=SC2086
           npx tdpw orchestrate run \
@@ -299,6 +310,7 @@ jobs:
           SPEC_COUNT: ${{ needs.discover.outputs.spec_count }}
           MODE: ${{ inputs.mode }}
           MACHINES: ${{ inputs.machines }}
+          WORKERS_INPUT: ${{ inputs.workers }}
         run: |
           set -uo pipefail
           psql() { docker exec ingestion-timescaledb psql -U postgres -d ingestion_dev -tAc "$1"; }
@@ -349,9 +361,18 @@ jobs:
           fi
 
           if [ "$MODE" = "all" ]; then
-            echo "── the W axis: >1 test in flight on one machine ──"
-            atleast "max concurrent workers on a machine" 2 \
-              "$(psql "SELECT COALESCE(MAX(c),0) FROM (SELECT device_id, count(DISTINCT parallel_index) c FROM test_cases WHERE run_id='$run_id' GROUP BY device_id) w")"
+            # parallel_index = -1 is Playwright's sentinel for a SKIPPED test (no
+            # worker ever ran it), so counting it inflates the worker count by one
+            # — a 5-worker run reported 6. Exclude it or the serial assertion
+            # below can never hold.
+            max_par=$(psql "SELECT COALESCE(MAX(c),0) FROM (SELECT device_id, count(DISTINCT parallel_index) c FROM test_cases WHERE run_id='$run_id' AND parallel_index >= 0 GROUP BY device_id) w")
+            if [ "$WORKERS_INPUT" = "1" ]; then
+              echo "── the W axis: serial, exactly one test in flight per machine ──"
+              check "max concurrent workers on a machine" 1 "$max_par"
+            else
+              echo "── the W axis: >1 test in flight on one machine ──"
+              atleast "max concurrent workers on a machine" 2 "$max_par"
+            fi
             echo "── retries reached the DB as extra attempts ──"
             atleast "retry rows" 1 \
               "$(psql "SELECT count(*) FROM test_cases WHERE run_id='$run_id' AND retry > 0")"
