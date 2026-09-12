@@ -10,3 +10,6 @@ node_modules/
 .DS_Store
 .degrade-run-count
 __screenshots__
+# orchestrate discover output (scripts/orch-local.sh)
+.orch-master.json
+master.json

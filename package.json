@@ -12,6 +12,8 @@
     "test:coverage:high": "COVERAGE=true npx tdpw test --coverage --project=coverage --grep @coverage-high --ci-run-id coverage-high --tags coverage,high",
     "test:coverage:all-profiles": "npm run test:coverage:low && npm run test:coverage:mid && npm run test:coverage:high",
     "test:split": "./scripts/split-local.sh",
+    "test:orch": "./scripts/orch-local.sh",
+    "test:orch:api": "ORCH_MODE=api ./scripts/orch-local.sh",
     "test:split:overlap": "SPLIT_OVERLAP=1 ./scripts/split-local.sh",
     "test:quota-burn": "./scripts/quota-burn.sh",
     "format": "prettier --write .",
@@ -31,7 +33,7 @@
     "vite-plugin-istanbul": "^7.0.12"
   },
   "dependencies": {
-    "@testdino/playwright": "^2.6.1",
+    "@testdino/playwright": "file:temp-cli/testdino-playwright-2.6.0.tgz",
     "playwright": "^1.62.1"
   }
 }
