@@ -1,0 +1,44 @@
+name: Install deps and the vendored tdpw CLI
+description: >
+  Restores node_modules from cache and guarantees `npx tdpw` is the vendored
+  2.6.0 build. `npm ci` on a cold runner costs ~30s, which is a quarter of this
+  workflow's 2-minute budget, so the cache is what makes the target reachable.
+
+inputs:
+  cache-scope:
+    description: >
+      Separates caches built on the runner host from ones built inside the
+      Playwright container — a node_modules tree from one is not guaranteed to
+      work in the other.
+    default: host
+
+runs:
+  using: composite
+  steps:
+    # The tarball is keyed in alongside the lockfile: bumping the vendored CLI
+    # changes its hash, so a stale tree can never be restored over a new build.
+    - id: cache
+      uses: actions/cache@v4
+      with:
+        path: node_modules
+        key: ${{ runner.os }}-node22-${{ inputs.cache-scope }}-${{ hashFiles('package-lock.json', 'temp-cli/testdino-playwright-2.6.0.tgz') }}
+
+    - if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: npm ci --prefer-offline --no-audit --no-fund
+
+    # package.json already carries the tarball as a `file:` dep, but installing it
+    # by path as well means a stale lockfile cannot leave `npx tdpw` pointing at a
+    # published build that does not understand `orchestrate`.
+    - if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: npm install --no-save --no-audit --no-fund "$CLI_TARBALL"
+
+    # Runs on cache hit too: the assertion is the only thing standing between a
+    # restored tree and a run that silently exercises the wrong CLI.
+    - shell: bash
+      run: |
+        set -euo pipefail
+        got=$(npx tdpw --version | tail -1 | tr -d '[:space:]')
+        echo "tdpw $got"
+        [ "$got" = "2.6.0" ] || { echo "::error::expected the vendored tdpw 2.6.0, got '$got'"; exit 1; }

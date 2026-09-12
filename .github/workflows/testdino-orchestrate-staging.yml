@@ -1,50 +1,62 @@
 name: TestDino orchestrate-mode (local via ngrok)
 
-# Manual validation of TestDino ORCHESTRATED mode against the LOCAL stack on
-# your Mac, reached through an ngrok tunnel. One workflow run == one
-# orchestration: a single `orchestrate discover` pre-step mints a shared id, then
-# N machines connect over WebSocket and the service PUSHES spec batches to them
-# until the queue drains. Every batch merges into ONE test_runs row, in your
-# local ingestion DB. The local equivalent is scripts/orch-local.sh.
+# Manual validation of TestDino ORCHESTRATED mode against the LOCAL stack on your
+# Mac, reached through an ngrok tunnel. One workflow run == one orchestration: a
+# single `orchestrate discover` pre-step mints a shared id, then N machines
+# connect over WebSocket and the service PUSHES spec batches to them until the
+# queue drains. Every batch merges into ONE test_runs row in your local ingestion
+# DB. The local equivalent is scripts/orch-local.sh (npm run test:orch).
 #
 # BEFORE DISPATCHING, on your Mac:
-#   1. the local stack must be up and the data-handler listening on :3005
-#   2. the orchestrator must be ENABLED — it ships dark. All three of
-#      ORCHESTRATE_PUSH_ENABLED, ORCHESTRATION_CONTROL_ENABLED and
-#      KAFKA_ORCHESTRATION_CONTROL_ENABLED must be true, then redeploy
-#      data-handler + ingestion. Preflight below fails rather than half-working.
-#   3. a tunnel must point at it:  ngrok http 3005 --domain <your-domain>
+#   1. the local stack is up and the data-handler is listening on :3005
+#   2. the orchestrator is ENABLED — it ships dark. ORCHESTRATE_PUSH_ENABLED,
+#      ORCHESTRATION_CONTROL_ENABLED and KAFKA_ORCHESTRATION_CONTROL_ENABLED must
+#      all be true, then redeploy data-handler + ingestion. Preflight fails below
+#      rather than letting the run half-work.
+#   3. a tunnel points at it:  ngrok http 3005 --domain <your-domain>
 #      A GitHub runner's localhost is the runner, not your Mac, so the tunnel is
-#      the only way back. Pass the URL as the tunnel_url input if it moved.
+#      the only way back. Pass tunnel_url if the domain moved.
 #
-# The CLI under test is temp-cli/testdino-playwright-2.6.0.tgz, installed
-# explicitly on every job so `npx tdpw` is that build and never the public one.
+# The CLI under test is temp-cli/testdino-playwright-2.6.0.tgz, installed by path
+# on every job so `npx tdpw` is that build and never the published package.
 #
 # Machines MUST run concurrently (no max-parallel): they do not choose their own
 # work, so a lone first machine drains the whole queue and every later machine
-# connects to a drained run and exits on `end`.
+# connects to a drained run and exits immediately on `end`.
+#
+# ── Why the scope is what it is ─────────────────────────────────────────────
+# The dispatch unit is (file, project): one file goes to ONE machine, so a single
+# slow file sets the wall-clock floor no matter how many machines you add. Timed
+# on a dev Mac at 5 workers:
+#     api project, all 5 files ......... 109 cases, 2m32s
+#       └ split-statuses.spec.js alone ... 80 cases, 219s of that 264s total
+#     the other 4 api files ............. 29 cases, ~45s
+#     chromium demo specs (passed/failed/flaky/skipped/multi-browser) .. 9m16s
+# api-lite therefore excludes split-statuses: it is 83% of the api cost sitting in
+# one indivisible unit. Browser scope cannot fit a 2-minute budget at all and is
+# kept only for the TDV2-831 multi-project regression.
 
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "api-lite = 4 api files, ~2 min; api-full adds the 80-case split-statuses; browser = TDV2-831 multi-project (slow)"
+        type: choice
+        default: "api-lite"
+        options: ["api-lite", "api-full", "browser"]
       machines:
         description: "Machines to distribute across"
         type: choice
         default: "2"
         options: ["2", "3", "4"]
-      mode:
-        description: "browser = chromium+firefox (multi-project); api = network-free, wider"
-        type: choice
-        default: "browser"
-        options: ["browser", "api"]
       tunnel_url:
         description: "ngrok URL fronting your local data-handler (:3005)"
         default: "https://railwayless-iris-ebulliently.ngrok-free.app"
 
 # Never cancel an orchestration mid-flight. A cancelled machine drops its
 # WebSocket with specs still inflight, which the dispatcher reads as a crash: the
-# specs are re-queued with a cooldown, and once every machine has exhausted its
-# 2 attempts they go could-not-execute and the run finalizes `incomplete`.
+# specs are re-queued with a cooldown, and once every machine has exhausted its 2
+# attempts they go could-not-execute and the run finalizes `incomplete`.
 concurrency:
   group: testdino-orchestrate-${{ github.run_id }}
   cancel-in-progress: false
@@ -57,13 +69,23 @@ env:
   TESTDINO_TOKEN: ${{ secrets.TESTDINO_TOKEN_LOCAL || 'td_api_b88525977df5ca624a2e5f886c05ed5e225e078efba854846accdeb5126045f5' }}
   TD_ENV: local
   CLI_TARBALL: ./temp-cli/testdino-playwright-2.6.0.tgz
+  # `playwright` is a runtime dep, so npm ci runs its browser-download postinstall
+  # (~30s) even for api specs that never open a browser. Only browser mode needs
+  # it, and there the container already ships them.
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
 
 jobs:
-  # Gate on the tunnel being up and the two orchestrator surfaces existing before
-  # spending runner time. Both are server-first: the CLI cannot degrade around a
-  # missing endpoint, so a 404 on either breaks every machine in the matrix.
-  preflight:
+  # Preflight is folded in here rather than living in its own job: a separate job
+  # costs a full runner startup (~45s of checkout + node + install) for two curls,
+  # which alone is a third of the 2-minute budget. The probes still run BEFORE the
+  # mint, so a dead tunnel or a disabled orchestrator fails without minting.
+  discover:
     runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      orchestration_id: ${{ steps.mint.outputs.orchestration_id }}
+      spec_count: ${{ steps.mint.outputs.spec_count }}
+      machine_ids: ${{ steps.mint.outputs.machine_ids }}
     steps:
       - name: Verify the tunnel reaches a local stack with the orchestrator enabled
         run: |
@@ -74,9 +96,9 @@ jobs:
 
           # The mint, authed with an empty body. 400 (suiteFingerprint required)
           # proves the route is mounted; 404 means either the build predates the
-          # endpoint or the project is soft-locked — both fatal, so fail on it.
-          # 000 here almost always means the ngrok tunnel is not running.
-          mint=$(curl -sS -o /dev/null -w '%{http_code}' \
+          # endpoint or the project is soft-locked — both fatal. 000/502 is almost
+          # always the ngrok agent not running.
+          mint=$(curl -sS -m 15 -o /dev/null -w '%{http_code}' \
             -X POST "$TESTDINO_SERVER_URL/api/v1/orchestrate/discover" \
             -H "Authorization: Bearer $TESTDINO_TOKEN" \
             -H "ngrok-skip-browser-warning: 1" \
@@ -92,7 +114,7 @@ jobs:
           # i.e. ORCHESTRATE_PUSH_ENABLED is false. Sending the token here would
           # NOT distinguish them: an authed probe of a nonexistent orchestration
           # also returns 404 (the tenant cloak), so the check would always pass.
-          ws=$(curl -sS -o /dev/null -w '%{http_code}' \
+          ws=$(curl -sS -m 15 -o /dev/null -w '%{http_code}' \
             -H "ngrok-skip-browser-warning: 1" \
             "$TESTDINO_SERVER_URL/ws/orchestrate/orch_preflight?machineId=probe" || echo 000)
           echo "GET /ws/orchestrate/{id} (no auth) -> HTTP $ws (401 expected)"
@@ -106,27 +128,12 @@ jobs:
           fi
           echo "Tunnel is live and both orchestrator surfaces are mounted."
 
-  # ONE authoritative discovery for the whole run. Every machine receives this
-  # id; none of them calls discover. Running it per-machine would mint N separate
-  # orchestrations, each executing the full suite.
-  discover:
-    needs: preflight
-    runs-on: ubuntu-latest
-    outputs:
-      orchestration_id: ${{ steps.mint.outputs.orchestration_id }}
-      spec_count: ${{ steps.mint.outputs.spec_count }}
-      machine_ids: ${{ steps.mint.outputs.machine_ids }}
-    steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
         with:
           node-version: 22
-          cache: npm
-      - run: npm ci
-      # package.json already carries the tarball as a file: dep, but install it
-      # by path as well so a stale lockfile can never leave `npx tdpw` pointing at
-      # a published build that does not understand `orchestrate`.
-      - run: npm install --no-save "$CLI_TARBALL"
+      - uses: ./.github/actions/install-tdpw
+
       - name: Mint the orchestration
         id: mint
         env:
@@ -134,21 +141,31 @@ jobs:
           MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
-          npx tdpw --version
           # discover filters by --project/--grep only (it lists the whole testDir),
           # so the spec set is chosen by filter, never by path.
-          if [ "$MODE" = "browser" ]; then
-            # multi-browser.spec.js carries all five browser tags, so ONE file
-            # yields TWO (file, project) units — the multi-project regression
-            # (TDV2-831). The --grep also proves grep propagation: the dispatcher
-            # echoes it on every assign frame so a batch runs only the discovered
-            # tests rather than the whole file.
-            npx tdpw orchestrate discover --machines "$MACHINES" \
-              --project chromium firefox --grep "Multi Browser" --out master.json
-          else
-            npx tdpw orchestrate discover --machines "$MACHINES" \
-              --project api --out master.json
-          fi
+          case "$MODE" in
+            api-lite)
+              # There is no --grep-invert, so split-statuses is excluded by a
+              # positive pattern instead: every one of the four API describes ends
+              # in "User API"/"Users API", and the split suites ("Split Passed
+              # Suite", …) match none of it. 29 cases, 4 dispatch units.
+              npx tdpw orchestrate discover --machines "$MACHINES" \
+                --project api --grep "Users? API" --out master.json
+              ;;
+            api-full)
+              npx tdpw orchestrate discover --machines "$MACHINES" \
+                --project api --out master.json
+              ;;
+            browser)
+              # multi-browser.spec.js carries all five browser tags, so ONE file
+              # yields TWO (file, project) units — the multi-project regression
+              # (TDV2-831). The --grep also proves grep propagation: the dispatcher
+              # echoes it on every assign frame so a batch runs only the discovered
+              # tests rather than the whole file.
+              npx tdpw orchestrate discover --machines "$MACHINES" \
+                --project chromium firefox --grep "Multi Browser" --out master.json
+              ;;
+          esac
 
           id=$(node -e "process.stdout.write(require('./master.json').orchestrationId)")
           specs=$(node -e "process.stdout.write(String(require('./master.json').specCount))")
@@ -164,14 +181,48 @@ jobs:
           echo "machine_ids=$ids"     >> "$GITHUB_OUTPUT"
           echo "::notice::minted $id with $specs specs across $MACHINES machines"
 
+      # Replaces the old `verdict` job. A job of its own would add a whole runner
+      # startup to the critical path just to print text; the step summary costs
+      # nothing and is easier to find than a log tail.
+      - name: Explain how to read the run
+        env:
+          ORCH_ID: ${{ steps.mint.outputs.orchestration_id }}
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ### orchestration \`$ORCH_ID\`
+          mode **${{ inputs.mode }}** · ${{ steps.mint.outputs.spec_count }} specs · ${{ inputs.machines }} machines
+          reported to ${{ inputs.tunnel_url }} (your local stack)
+
+          A machine job exiting 0 only means it received the \`end\` signal — its
+          tests may still have failed (ORCH-F2, tracked on the CLI). A green matrix
+          is NOT evidence the suite passed; read the run status instead:
+          \`incomplete\` = a spec could not execute on ANY machine (2 attempts each).
+
+          \`\`\`sh
+          # the ONE merged row
+          docker exec ingestion-timescaledb psql -U postgres -d ingestion_dev -c \\
+            "SELECT id, status, total_tests, could_not_execute_specs
+               FROM test_runs WHERE orchestration_id = '$ORCH_ID';"
+
+          # per-machine attribution — the point of device_id
+          docker exec ingestion-timescaledb psql -U postgres -d ingestion_dev -c \\
+            "SELECT device_id, count(*) FROM test_cases
+              WHERE run_id = (SELECT id FROM test_runs WHERE orchestration_id = '$ORCH_ID')
+              GROUP BY 1 ORDER BY 1;"
+          \`\`\`
+          EOF
+
   machine:
     needs: discover
     name: machine ${{ matrix.machine }}
     runs-on: ubuntu-latest
-    container:
-      # Browsers are baked into this image, so no `playwright install` step.
-      # Keep the version in sync with @playwright/test in package-lock.json.
-      image: mcr.microsoft.com/playwright:v1.57.0-noble
+    # A backstop, not the target — the api-lite scope is ~45s of work. Note that a
+    # machine killed by this timeout crash-requeues its inflight specs, so raise it
+    # rather than let a legitimately slower scope get cancelled here.
+    timeout-minutes: 2
+    # Only browser mode needs baked-in browsers; pulling this image for api specs
+    # costs ~30s of a 2-minute budget. `null` means run directly on the runner.
+    container: ${{ fromJSON(inputs.mode == 'browser' && '{"image":"mcr.microsoft.com/playwright:v1.57.0-noble"}' || 'null') }}
     strategy:
       # A machine that fails must NOT cancel its siblings: they are still holding
       # inflight specs, and cancelling them would crash-requeue that work.
@@ -180,15 +231,18 @@ jobs:
       matrix:
         machine: ${{ fromJSON(needs.discover.outputs.machine_ids) }}
     env:
-      HOME: /root # the playwright image runs as root; browsers live under /root
+      # In the container GHA points HOME at /github/home, but the image runs as
+      # root and its baked browsers live under /root. On the host runner /root is
+      # not writable, so it must stay the runner's own home or npm ci dies EACCES.
+      HOME: ${{ inputs.mode == 'browser' && '/root' || '/home/runner' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
         with:
           node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm install --no-save "$CLI_TARBALL"
+      - uses: ./.github/actions/install-tdpw
+        with:
+          cache-scope: ${{ inputs.mode == 'browser' && 'container' || 'host' }}
       - name: Join ${{ needs.discover.outputs.orchestration_id }} as ${{ matrix.machine }}
         # GitHub Actions has no native per-machine index, so the device id comes
         # from the matrix. It MUST be unique per leg: two machines reporting the
@@ -198,38 +252,3 @@ jobs:
           npx tdpw orchestrate run \
             --orchestration-id "${{ needs.discover.outputs.orchestration_id }}" \
             --device-id "${{ matrix.machine }}"
-
-  # The machine jobs exit 0 whenever the hub sends `end`, even when their tests
-  # failed (ORCH-F2, tracked on the CLI), so a green matrix is NOT evidence the
-  # suite passed. Read the run's own status instead.
-  verdict:
-    needs: [discover, machine]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: How to read this run
-        run: |
-          cat <<EOF
-          orchestration: ${{ needs.discover.outputs.orchestration_id }}
-          specs:         ${{ needs.discover.outputs.spec_count }}
-          reported to:   ${{ inputs.tunnel_url }} (your local stack)
-
-          A machine job exiting 0 only means it received the end signal. Check the
-          TestDino run status for the real verdict:
-            - 'incomplete'  => at least one spec could not be executed on ANY
-                               machine (2 attempts each). Coverage is missing; the
-                               specs are listed on the run.
-            - failed/passed => every spec ran; this is the honest suite result.
-
-          Locally, the merged row (one per orchestration):
-            docker exec ingestion-timescaledb psql -U postgres -d ingestion_dev -c \\
-              "SELECT id, status, total_tests, could_not_execute_specs
-                 FROM test_runs WHERE orchestration_id = '${{ needs.discover.outputs.orchestration_id }}';"
-
-          Per-machine attribution — every machine that ran anything must appear:
-            docker exec ingestion-timescaledb psql -U postgres -d ingestion_dev -c \\
-              "SELECT device_id, count(*) FROM test_cases
-                WHERE run_id = (SELECT id FROM test_runs
-                                 WHERE orchestration_id = '${{ needs.discover.outputs.orchestration_id }}')
-                GROUP BY 1 ORDER BY 1;"
-          EOF
