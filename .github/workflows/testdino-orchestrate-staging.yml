@@ -48,10 +48,10 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "all = every scenario in one run (~3m); api-lite = 4 api files (~20s); api-full adds the 80-case split-statuses; browser = TDV2-831 multi-project only"
+        description: "all = orchestration + a sibling sharded run (~3m); api-lite = 4 api files (~20s); api-full adds the 80-case split-statuses; browser = TDV2-831 multi-project only; shards = the sharded path alone"
         type: choice
         default: "all"
-        options: ["all", "api-lite", "api-full", "browser"]
+        options: ["all", "api-lite", "api-full", "browser", "shards"]
       machines:
         description: "Machines to distribute across — you must have at least this many runners online"
         type: choice
@@ -283,7 +283,7 @@ jobs:
   # local DB. Possible only because the runner IS the machine hosting the stack;
   # a green matrix proves the machines exited, not that the data landed.
   verify:
-    needs: [discover, machine]
+    needs: [discover, machine, shards]
     if: always() && needs.discover.result == 'success'
     runs-on: [self-hosted, testdino-local]
     timeout-minutes: 3
@@ -356,7 +356,61 @@ jobs:
           fi
 
           echo
-          psql "SELECT device_id || '  ' || (title_path->>1) || '  tests=' || count(DISTINCT pw_test_id) || '  rows=' || count(*) FROM test_cases WHERE run_id='$run_id' GROUP BY 1,2 ORDER BY 1,2" \
+          # ORDER BY must name the grouped expressions: the select list is one
+          # concatenated column, so positional ORDER BY 1,2 is out of range.
+          psql "SELECT device_id || '  ' || (title_path->>1) || '  tests=' || count(DISTINCT pw_test_id) || '  rows=' || count(*) FROM test_cases WHERE run_id='$run_id' GROUP BY device_id, title_path->>1 ORDER BY device_id, title_path->>1" \
             | sed 's/^/  /'
 
+          if [ "$MODE" = "all" ] || [ "$MODE" = "shards" ]; then
+            echo
+            echo "── sibling sharded run (the shard path, which shares GetCaseRows) ──"
+            sharded_id=$(psql "SELECT id FROM test_runs WHERE ci_run_id='sharded-${{ github.run_id }}-${{ github.run_attempt }}'" | tr -d '[:space:]')
+            if [ -z "$sharded_id" ]; then
+              echo "::error::no sharded run row for this workflow run"; fail=1
+            else
+              check "declared shards" 2 "$(psql "SELECT total_shards FROM test_runs WHERE id='$sharded_id'")"
+              atleast "shards reporting cases" 2 \
+                "$(psql "SELECT count(DISTINCT shard_index) FROM test_cases WHERE run_id='$sharded_id' AND shard_index IS NOT NULL")"
+              # Orchestration and sharding are separate run modes, never one run.
+              check "sharded run carries no orchestration" "" \
+                "$(psql "SELECT COALESCE(orchestration_id,'') FROM test_runs WHERE id='$sharded_id'" | tr -d '[:space:]')"
+              check "sharded cases carry no device" 0 \
+                "$(psql "SELECT count(*) FROM test_cases WHERE run_id='$sharded_id' AND device_id IS NOT NULL")"
+              psql "SELECT 'shard ' || shard_index || '  tests=' || count(DISTINCT pw_test_id) FROM test_cases WHERE run_id='$sharded_id' GROUP BY shard_index ORDER BY shard_index" | sed 's/^/  /'
+            fi
+            echo "── and the orchestrated run records no shard total ──"
+            check "orchestrated total_shards" "" \
+              "$(psql "SELECT COALESCE(total_shards::text,'') FROM test_runs WHERE id='$run_id'" | tr -d '[:space:]')"
+          fi
+
           exit $fail
+
+  shards:
+    # Runs after `machine` so the two do not compete for the same runners.
+    needs: [discover, machine]
+    if: always() && (inputs.mode == 'all' || inputs.mode == 'shards')
+    name: shard ${{ matrix.shard }}/2
+    runs-on: [self-hosted, testdino-local]
+    timeout-minutes: 6
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - uses: ./.github/actions/install-tdpw
+      - name: Run shard ${{ matrix.shard }}/2
+        env:
+          # Both legs MUST share this: ci-run-id is the shard group key, so a
+          # per-leg value produces two unrelated single-shard runs instead of one
+          # two-shard run.
+          CI_RUN_ID: sharded-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          npx tdpw test \
+            --ci-run-id "$CI_RUN_ID" \
+            --shard=${{ matrix.shard }}/2 \
+            --project=api \
+            tests/post-api.spec.js tests/get-users.spec.js
