@@ -271,13 +271,18 @@ jobs:
           # unrelated to orchestration. 2 still exercises W>1. Harmless that
           # discover recorded W=5 from the config: under fullyParallel the
           # dispatcher hands out 1 spec regardless of W, so W only weighted LPT.
-          workers_args=()
-          if [ "$MODE" = "all" ]; then workers_args=(--workers=2); fi
+          # A plain string, not an array: macOS ships bash 3.2, where expanding an
+          # EMPTY array as "${a[@]}" under `set -u` is an unbound-variable error.
+          # Every mode except `all` leaves it empty, which killed both machines
+          # before the CLI ran. Unquoted on purpose so empty expands to nothing.
+          workers_arg=""
+          if [ "$MODE" = "all" ]; then workers_arg="--workers=2"; fi
 
+          # shellcheck disable=SC2086
           npx tdpw orchestrate run \
             --orchestration-id "${{ needs.discover.outputs.orchestration_id }}" \
             --device-id "${{ matrix.machine }}" \
-            "${workers_args[@]}"
+            $workers_arg
 
   # Asserts the run actually exercised what the mode claims, straight from the
   # local DB. Possible only because the runner IS the machine hosting the stack;
