@@ -1,21 +1,28 @@
-name: TestDino orchestrate-mode (staging)
+name: TestDino orchestrate-mode (local via ngrok)
 
-# Manual validation of TestDino ORCHESTRATED mode against STAGING. One workflow
-# run == one orchestration: a single `orchestrate discover` pre-step mints a
-# shared id, then N machines connect over WebSocket and the service PUSHES spec
-# batches to them until the queue drains. Every batch merges into ONE test_runs
-# row. The local equivalent is scripts/orch-local.sh (npm run test:orch).
+# Manual validation of TestDino ORCHESTRATED mode against the LOCAL stack on
+# your Mac, reached through an ngrok tunnel. One workflow run == one
+# orchestration: a single `orchestrate discover` pre-step mints a shared id, then
+# N machines connect over WebSocket and the service PUSHES spec batches to them
+# until the queue drains. Every batch merges into ONE test_runs row, in your
+# local ingestion DB. The local equivalent is scripts/orch-local.sh.
 #
-# REQUIRES the orchestrator to be ENABLED on the target. It ships dark:
-# staging.env.example sets ORCHESTRATE_PUSH_ENABLED, ORCHESTRATION_CONTROL_ENABLED
-# and KAFKA_ORCHESTRATION_CONTROL_ENABLED to false. All three must be true, or
-# preflight fails below rather than letting the run half-work.
+# BEFORE DISPATCHING, on your Mac:
+#   1. the local stack must be up and the data-handler listening on :3005
+#   2. the orchestrator must be ENABLED — it ships dark. All three of
+#      ORCHESTRATE_PUSH_ENABLED, ORCHESTRATION_CONTROL_ENABLED and
+#      KAFKA_ORCHESTRATION_CONTROL_ENABLED must be true, then redeploy
+#      data-handler + ingestion. Preflight below fails rather than half-working.
+#   3. a tunnel must point at it:  ngrok http 3005 --domain <your-domain>
+#      A GitHub runner's localhost is the runner, not your Mac, so the tunnel is
+#      the only way back. Pass the URL as the tunnel_url input if it moved.
 #
-# How this differs from testdino-split-staging.yml, structurally:
-#   - split legs are independent; here a discover job must publish the id first
-#   - split serializes legs (max-parallel: 1); here they MUST be concurrent — the
-#     machines do not choose their work, so a lone first machine drains the whole
-#     queue and every later machine connects to a drained run and exits on `end`
+# The CLI under test is temp-cli/testdino-playwright-2.6.0.tgz, installed
+# explicitly on every job so `npx tdpw` is that build and never the public one.
+#
+# Machines MUST run concurrently (no max-parallel): they do not choose their own
+# work, so a lone first machine drains the whole queue and every later machine
+# connects to a drained run and exits on `end`.
 
 on:
   workflow_dispatch:
@@ -30,6 +37,9 @@ on:
         type: choice
         default: "browser"
         options: ["browser", "api"]
+      tunnel_url:
+        description: "ngrok URL fronting your local data-handler (:3005)"
+        default: "https://railwayless-iris-ebulliently.ngrok-free.app"
 
 # Never cancel an orchestration mid-flight. A cancelled machine drops its
 # WebSocket with specs still inflight, which the dispatcher reads as a crash: the
@@ -40,32 +50,40 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  TESTDINO_SERVER_URL: ${{ secrets.TESTDINO_STAGING_URL }}
-  TESTDINO_TOKEN: ${{ secrets.TESTDINO_STAGING_TOKEN }}
+  # An explicit URL wins over TD_ENV in playwright.config.js, so the reporter and
+  # the CLI both talk to the tunnel rather than to the runner's own localhost.
+  TESTDINO_SERVER_URL: ${{ inputs.tunnel_url }}
+  # The orch project's LOCAL token. A staging/prod token is a 401 here.
+  TESTDINO_TOKEN: ${{ secrets.TESTDINO_TOKEN_LOCAL || 'td_api_b88525977df5ca624a2e5f886c05ed5e225e078efba854846accdeb5126045f5' }}
+  TD_ENV: local
+  CLI_TARBALL: ./temp-cli/testdino-playwright-2.6.0.tgz
 
 jobs:
-  # Gate on the two orchestrator surfaces existing before spending runner time.
-  # Both are server-first: the CLI cannot degrade around a missing endpoint, so a
-  # 404 on either breaks every machine in the matrix.
+  # Gate on the tunnel being up and the two orchestrator surfaces existing before
+  # spending runner time. Both are server-first: the CLI cannot degrade around a
+  # missing endpoint, so a 404 on either breaks every machine in the matrix.
   preflight:
     runs-on: ubuntu-latest
     steps:
-      - name: Verify the orchestrator is deployed and enabled
+      - name: Verify the tunnel reaches a local stack with the orchestrator enabled
         run: |
           set -uo pipefail
-          [ -n "${TESTDINO_SERVER_URL:-}" ] || { echo "::error::TESTDINO_STAGING_URL secret is not set"; exit 1; }
-          [ -n "${TESTDINO_TOKEN:-}" ] || { echo "::error::TESTDINO_STAGING_TOKEN secret is not set"; exit 1; }
+          [ -n "${TESTDINO_SERVER_URL:-}" ] || { echo "::error::tunnel_url is empty"; exit 1; }
+          [ -n "${TESTDINO_TOKEN:-}" ] || { echo "::error::no local TestDino token"; exit 1; }
+          echo "Target: $TESTDINO_SERVER_URL"
 
           # The mint, authed with an empty body. 400 (suiteFingerprint required)
           # proves the route is mounted; 404 means either the build predates the
           # endpoint or the project is soft-locked — both fatal, so fail on it.
+          # 000 here almost always means the ngrok tunnel is not running.
           mint=$(curl -sS -o /dev/null -w '%{http_code}' \
             -X POST "$TESTDINO_SERVER_URL/api/v1/orchestrate/discover" \
             -H "Authorization: Bearer $TESTDINO_TOKEN" \
+            -H "ngrok-skip-browser-warning: 1" \
             -H "Content-Type: application/json" -d '{}' || echo 000)
           echo "POST /api/v1/orchestrate/discover -> HTTP $mint (400 expected)"
           if [ "$mint" != "400" ]; then
-            echo "::error::mint not usable ($mint). 404 = endpoint absent from this build, or the project is soft-locked. 401 = bad/non-td_api_ token."
+            echo "::error::mint not usable ($mint). 000/502 = the ngrok tunnel or the local data-handler is down. 404 = endpoint absent from this build, or the project is soft-locked. 401 = wrong-environment token (this workflow needs the LOCAL one)."
             exit 1
           fi
 
@@ -75,17 +93,18 @@ jobs:
           # NOT distinguish them: an authed probe of a nonexistent orchestration
           # also returns 404 (the tenant cloak), so the check would always pass.
           ws=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "ngrok-skip-browser-warning: 1" \
             "$TESTDINO_SERVER_URL/ws/orchestrate/orch_preflight?machineId=probe" || echo 000)
           echo "GET /ws/orchestrate/{id} (no auth) -> HTTP $ws (401 expected)"
           if [ "$ws" = "404" ]; then
-            echo "::error::the WS hub is not mounted — set ORCHESTRATE_PUSH_ENABLED=true on the data-handler reader. Without it the mint succeeds and only the socket 404s, which looks like a CLI bug."
+            echo "::error::the WS hub is not mounted — set ORCHESTRATE_PUSH_ENABLED=true on the data-handler reader and redeploy. Without it the mint succeeds and only the socket 404s, which looks like a CLI bug."
             exit 1
           fi
           if [ "$ws" != "401" ]; then
             echo "::error::unexpected WS probe status ($ws); expected 401 (mounted) or 404 (unmounted)."
             exit 1
           fi
-          echo "Both orchestrator surfaces are live."
+          echo "Tunnel is live and both orchestrator surfaces are mounted."
 
   # ONE authoritative discovery for the whole run. Every machine receives this
   # id; none of them calls discover. Running it per-machine would mint N separate
@@ -103,9 +122,11 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      # Installs the repo's vendored @testdino/playwright (file: dep) so `npx tdpw`
-      # is the CLI that understands `orchestrate`, not the stale public package.
       - run: npm ci
+      # package.json already carries the tarball as a file: dep, but install it
+      # by path as well so a stale lockfile can never leave `npx tdpw` pointing at
+      # a published build that does not understand `orchestrate`.
+      - run: npm install --no-save "$CLI_TARBALL"
       - name: Mint the orchestration
         id: mint
         env:
@@ -113,6 +134,7 @@ jobs:
           MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
+          npx tdpw --version
           # discover filters by --project/--grep only (it lists the whole testDir),
           # so the spec set is chosen by filter, never by path.
           if [ "$MODE" = "browser" ]; then
@@ -166,6 +188,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm install --no-save "$CLI_TARBALL"
       - name: Join ${{ needs.discover.outputs.orchestration_id }} as ${{ matrix.machine }}
         # GitHub Actions has no native per-machine index, so the device id comes
         # from the matrix. It MUST be unique per leg: two machines reporting the
@@ -189,6 +212,7 @@ jobs:
           cat <<EOF
           orchestration: ${{ needs.discover.outputs.orchestration_id }}
           specs:         ${{ needs.discover.outputs.spec_count }}
+          reported to:   ${{ inputs.tunnel_url }} (your local stack)
 
           A machine job exiting 0 only means it received the end signal. Check the
           TestDino run status for the real verdict:
@@ -196,4 +220,16 @@ jobs:
                                machine (2 attempts each). Coverage is missing; the
                                specs are listed on the run.
             - failed/passed => every spec ran; this is the honest suite result.
+
+          Locally, the merged row (one per orchestration):
+            docker exec ingestion-timescaledb psql -U postgres -d ingestion_dev -c \\
+              "SELECT id, status, total_tests, could_not_execute_specs
+                 FROM test_runs WHERE orchestration_id = '${{ needs.discover.outputs.orchestration_id }}';"
+
+          Per-machine attribution — every machine that ran anything must appear:
+            docker exec ingestion-timescaledb psql -U postgres -d ingestion_dev -c \\
+              "SELECT device_id, count(*) FROM test_cases
+                WHERE run_id = (SELECT id FROM test_runs
+                                 WHERE orchestration_id = '${{ needs.discover.outputs.orchestration_id }}')
+                GROUP BY 1 ORDER BY 1;"
           EOF
