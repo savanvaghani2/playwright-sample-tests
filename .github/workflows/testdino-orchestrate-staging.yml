@@ -1,57 +1,62 @@
-name: TestDino orchestrate-mode (local via ngrok)
+name: TestDino orchestrate-mode (local, self-hosted)
 
-# Manual validation of TestDino ORCHESTRATED mode against the LOCAL stack on your
-# Mac, reached through an ngrok tunnel. One workflow run == one orchestration: a
-# single `orchestrate discover` pre-step mints a shared id, then N machines
-# connect over WebSocket and the service PUSHES spec batches to them until the
-# queue drains. Every batch merges into ONE test_runs row in your local ingestion
-# DB. The local equivalent is scripts/orch-local.sh (npm run test:orch).
+# Manual validation of TestDino ORCHESTRATED mode against the LOCAL stack, run on
+# SELF-HOSTED runners on the same Mac as that stack. One workflow run == one
+# orchestration: a single `orchestrate discover` pre-step mints a shared id, then
+# N machines connect over WebSocket and the service PUSHES spec batches to them
+# until the queue drains. Every batch merges into ONE test_runs row in the local
+# ingestion DB. The local equivalent is scripts/orch-local.sh (npm run test:orch).
 #
-# BEFORE DISPATCHING, on your Mac:
-#   1. the local stack is up and the data-handler is listening on :3005
+# ── Why self-hosted, and not a tunnel ───────────────────────────────────────
+# The reporter does not choose where to send results: it uses what the server
+# advertises in the auth response — `auth.kafka.brokers` and `auth.httpFallback`
+# — and the local stack advertises localhost:19092 and localhost:3004. There is no
+# client-side override. On a GitHub-hosted runner those resolve to the RUNNER, so
+# a run reaches the control plane, executes every spec, and then dies with
+# "Kafka connection failed" + "ECONNREFUSED 127.0.0.1:3004" having delivered
+# nothing. An HTTP tunnel in front of :3005 cannot fix that: it carries auth, mint
+# and the WebSocket dispatch, but the data plane is a different address that the
+# server still hands out as localhost. A runner ON the Mac makes localhost true.
+#
+# REQUIREMENTS on the Mac:
+#   1. the local stack is up: data-handler :3005, ingestion :3004, kafka :19092
 #   2. the orchestrator is ENABLED — it ships dark. ORCHESTRATE_PUSH_ENABLED,
 #      ORCHESTRATION_CONTROL_ENABLED and KAFKA_ORCHESTRATION_CONTROL_ENABLED must
 #      all be true, then redeploy data-handler + ingestion. Preflight fails below
 #      rather than letting the run half-work.
-#   3. a tunnel points at it:  ngrok http 3005 --domain <your-domain>
-#      A GitHub runner's localhost is the runner, not your Mac, so the tunnel is
-#      the only way back. Pass tunnel_url if the domain moved.
+#   3. AT LEAST AS MANY RUNNERS AS `machines`, all labelled `testdino-local`.
+#      This is not an optimisation. A runner executes one job at a time, so with a
+#      single runner m1 starts alone, drains the entire queue, and m2 only then
+#      starts, connects to a drained orchestration and exits on `end`. The result
+#      looks like a pass with half the machines contributing nothing.
 #
 # The CLI under test is temp-cli/testdino-playwright-2.6.0.tgz, installed by path
 # on every job so `npx tdpw` is that build and never the published package.
 #
-# Machines MUST run concurrently (no max-parallel): they do not choose their own
-# work, so a lone first machine drains the whole queue and every later machine
-# connects to a drained run and exits immediately on `end`.
-#
 # ── Why the scope is what it is ─────────────────────────────────────────────
 # The dispatch unit is (file, project): one file goes to ONE machine, so a single
 # slow file sets the wall-clock floor no matter how many machines you add. Timed
-# on a dev Mac at 5 workers:
+# on this Mac at 5 workers:
 #     api project, all 5 files ......... 109 cases, 2m32s
 #       └ split-statuses.spec.js alone ... 80 cases, 219s of that 264s total
-#     the other 4 api files ............. 29 cases, ~45s
+#     the other 4 api files ............. 29 cases, ~45s (19s over 2 machines)
 #     chromium demo specs (passed/failed/flaky/skipped/multi-browser) .. 9m16s
 # api-lite therefore excludes split-statuses: it is 83% of the api cost sitting in
-# one indivisible unit. Browser scope cannot fit a 2-minute budget at all and is
-# kept only for the TDV2-831 multi-project regression.
+# one indivisible unit.
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "api-lite = 4 api files, ~2 min; api-full adds the 80-case split-statuses; browser = TDV2-831 multi-project (slow)"
+        description: "api-lite = 4 api files (~20s); api-full adds the 80-case split-statuses; browser = TDV2-831 multi-project (slow)"
         type: choice
         default: "api-lite"
         options: ["api-lite", "api-full", "browser"]
       machines:
-        description: "Machines to distribute across"
+        description: "Machines to distribute across — you must have at least this many runners online"
         type: choice
         default: "2"
         options: ["2", "3", "4"]
-      tunnel_url:
-        description: "ngrok URL fronting your local data-handler (:3005)"
-        default: "https://railwayless-iris-ebulliently.ngrok-free.app"
 
 # Never cancel an orchestration mid-flight. A cancelled machine drops its
 # WebSocket with specs still inflight, which the dispatcher reads as a crash: the
@@ -62,9 +67,10 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # An explicit URL wins over TD_ENV in playwright.config.js, so the reporter and
-  # the CLI both talk to the tunnel rather than to the runner's own localhost.
-  TESTDINO_SERVER_URL: ${{ inputs.tunnel_url }}
+  # Explicit, because playwright.config.js maps TD_ENV=local to the ngrok tunnel
+  # whenever CI is set — correct for a GitHub-hosted runner, wrong here. An
+  # explicit URL wins over that mapping.
+  TESTDINO_SERVER_URL: http://localhost:3005
   # The orch project's LOCAL token. A staging/prod token is a 401 here.
   TESTDINO_TOKEN: ${{ secrets.TESTDINO_TOKEN_LOCAL || 'td_api_b88525977df5ca624a2e5f886c05ed5e225e078efba854846accdeb5126045f5' }}
   TD_ENV: local
@@ -72,36 +78,33 @@ env:
 
 jobs:
   # Preflight is folded in here rather than living in its own job: a separate job
-  # costs a full runner startup (~45s of checkout + node + install) for two curls,
-  # which alone is a third of the 2-minute budget. The probes still run BEFORE the
-  # mint, so a dead tunnel or a disabled orchestrator fails without minting.
+  # costs a full runner startup for two curls. The probes still run BEFORE the
+  # mint, so a down stack or a disabled orchestrator fails without minting.
   discover:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, testdino-local]
     timeout-minutes: 2
     outputs:
       orchestration_id: ${{ steps.mint.outputs.orchestration_id }}
       spec_count: ${{ steps.mint.outputs.spec_count }}
       machine_ids: ${{ steps.mint.outputs.machine_ids }}
     steps:
-      - name: Verify the tunnel reaches a local stack with the orchestrator enabled
+      - name: Verify the local stack is up with the orchestrator enabled
         run: |
           set -uo pipefail
-          [ -n "${TESTDINO_SERVER_URL:-}" ] || { echo "::error::tunnel_url is empty"; exit 1; }
           [ -n "${TESTDINO_TOKEN:-}" ] || { echo "::error::no local TestDino token"; exit 1; }
           echo "Target: $TESTDINO_SERVER_URL"
 
           # The mint, authed with an empty body. 400 (suiteFingerprint required)
           # proves the route is mounted; 404 means either the build predates the
-          # endpoint or the project is soft-locked — both fatal. 000/502 is almost
-          # always the ngrok agent not running.
+          # endpoint or the project is soft-locked — both fatal. 000 means the
+          # data-handler is not listening on :3005.
           mint=$(curl -sS -m 15 -o /dev/null -w '%{http_code}' \
             -X POST "$TESTDINO_SERVER_URL/api/v1/orchestrate/discover" \
             -H "Authorization: Bearer $TESTDINO_TOKEN" \
-            -H "ngrok-skip-browser-warning: 1" \
             -H "Content-Type: application/json" -d '{}' || echo 000)
           echo "POST /api/v1/orchestrate/discover -> HTTP $mint (400 expected)"
           if [ "$mint" != "400" ]; then
-            echo "::error::mint not usable ($mint). 000/502 = the ngrok tunnel or the local data-handler is down. 404 = endpoint absent from this build, or the project is soft-locked. 401 = wrong-environment token (this workflow needs the LOCAL one)."
+            echo "::error::mint not usable ($mint). 000 = the local data-handler is not up on :3005. 404 = endpoint absent from this build, or the project is soft-locked. 401 = wrong-environment token (this workflow needs the LOCAL one)."
             exit 1
           fi
 
@@ -111,7 +114,6 @@ jobs:
           # NOT distinguish them: an authed probe of a nonexistent orchestration
           # also returns 404 (the tenant cloak), so the check would always pass.
           ws=$(curl -sS -m 15 -o /dev/null -w '%{http_code}' \
-            -H "ngrok-skip-browser-warning: 1" \
             "$TESTDINO_SERVER_URL/ws/orchestrate/orch_preflight?machineId=probe" || echo 000)
           echo "GET /ws/orchestrate/{id} (no auth) -> HTTP $ws (401 expected)"
           if [ "$ws" = "404" ]; then
@@ -122,16 +124,24 @@ jobs:
             echo "::error::unexpected WS probe status ($ws); expected 401 (mounted) or 404 (unmounted)."
             exit 1
           fi
-          echo "Tunnel is live and both orchestrator surfaces are mounted."
+
+          # The data plane. Unreachable here means results are silently discarded
+          # after every spec has run — the exact failure self-hosted exists to
+          # avoid — so fail before minting rather than after executing.
+          for hostport in localhost:3004 localhost:19092; do
+            nc -z -G 2 "${hostport%:*}" "${hostport#*:}" \
+              || { echo "::error::$hostport unreachable — the reporter delivers results there (auth.httpFallback / auth.kafka.brokers) and would discard the whole run."; exit 1; }
+            echo "$hostport reachable"
+          done
+          echo "Local stack is up and both orchestrator surfaces are mounted."
 
       - uses: actions/checkout@v7
+      # Kept even though the Mac has node 22: the runner started via svc.sh runs
+      # under launchd with a minimal PATH, where a system node is not guaranteed.
       - uses: actions/setup-node@v6
         with:
           node-version: 22
       - uses: ./.github/actions/install-tdpw
-        with:
-          # discover only lists the test set; nothing here opens a browser.
-          install-browsers: "false"
 
       - name: Mint the orchestration
         id: mint
@@ -180,9 +190,9 @@ jobs:
           echo "machine_ids=$ids"     >> "$GITHUB_OUTPUT"
           echo "::notice::minted $id with $specs specs across $MACHINES machines"
 
-      # Replaces the old `verdict` job. A job of its own would add a whole runner
-      # startup to the critical path just to print text; the step summary costs
-      # nothing and is easier to find than a log tail.
+      # Replaces a `verdict` job. A job of its own would add a whole runner startup
+      # to the critical path just to print text, and on self-hosted it would also
+      # occupy a runner the machines need.
       - name: Explain how to read the run
         env:
           ORCH_ID: ${{ steps.mint.outputs.orchestration_id }}
@@ -190,7 +200,6 @@ jobs:
           cat >> "$GITHUB_STEP_SUMMARY" <<EOF
           ### orchestration \`$ORCH_ID\`
           mode **${{ inputs.mode }}** · ${{ steps.mint.outputs.spec_count }} specs · ${{ inputs.machines }} machines
-          reported to ${{ inputs.tunnel_url }} (your local stack)
 
           A machine job exiting 0 only means it received the \`end\` signal — its
           tests may still have failed (ORCH-F2, tracked on the CLI). A green matrix
@@ -214,14 +223,10 @@ jobs:
   machine:
     needs: discover
     name: machine ${{ matrix.machine }}
-    runs-on: ubuntu-latest
-    # A backstop, not the target — the api-lite scope is ~45s of work. Note that a
-    # machine killed by this timeout crash-requeues its inflight specs, so raise it
-    # rather than let a legitimately slower scope get cancelled here.
+    # No `container:` — GitHub Actions does not support job containers on macOS
+    # runners, and none is needed: the browsers are already installed on the Mac.
+    runs-on: [self-hosted, testdino-local]
     timeout-minutes: 2
-    # Only browser mode needs baked-in browsers; pulling this image for api specs
-    # costs ~30s of a 2-minute budget. `null` means run directly on the runner.
-    container: ${{ fromJSON(inputs.mode == 'browser' && '{"image":"mcr.microsoft.com/playwright:v1.57.0-noble"}' || 'null') }}
     strategy:
       # A machine that fails must NOT cancel its siblings: they are still holding
       # inflight specs, and cancelling them would crash-requeue that work.
@@ -229,22 +234,12 @@ jobs:
       # NO max-parallel. Every machine must be connected at once — see the header.
       matrix:
         machine: ${{ fromJSON(needs.discover.outputs.machine_ids) }}
-    env:
-      # In the container GHA points HOME at /github/home, but the image runs as
-      # root and its baked browsers live under /root. On the host runner /root is
-      # not writable, so it must stay the runner's own home or npm ci dies EACCES.
-      HOME: ${{ inputs.mode == 'browser' && '/root' || '/home/runner' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v6
         with:
           node-version: 22
       - uses: ./.github/actions/install-tdpw
-        with:
-          cache-scope: ${{ inputs.mode == 'browser' && 'container' || 'host' }}
-          # The container bakes its own browsers; installing again would just
-          # duplicate them under a different root.
-          install-browsers: ${{ inputs.mode == 'browser' && 'false' || 'true' }}
       - name: Join ${{ needs.discover.outputs.orchestration_id }} as ${{ matrix.machine }}
         # GitHub Actions has no native per-machine index, so the device id comes
         # from the matrix. It MUST be unique per leg: two machines reporting the

@@ -1,59 +1,24 @@
 name: Install deps and the vendored tdpw CLI
 description: >
-  Restores node_modules from cache and guarantees `npx tdpw` is the vendored
-  2.6.0 build. `npm ci` on a cold runner costs ~30s, which is a quarter of this
-  workflow's 2-minute budget, so the cache is what makes the target reachable.
-
-inputs:
-  install-browsers:
-    description: >
-      Install Chromium. Required even for the api project: its specs import from
-      tests/support/test.js, which re-exports @testdino/playwright and brings an
-      auto `page` fixture with it — so every api test launches a browser. Set
-      false only inside the Playwright container, which already ships them.
-    default: "true"
-  cache-scope:
-    description: >
-      Separates caches built on the runner host from ones built inside the
-      Playwright container — a node_modules tree from one is not guaranteed to
-      work in the other.
-    default: host
+  Installs dependencies and guarantees `npx tdpw` is the vendored 2.6.0 build.
+  No actions/cache here: on a self-hosted Mac the npm cache is already warm and
+  the Playwright browsers are installed system-wide, so a cache round-trip would
+  cost more than it saves.
 
 runs:
   using: composite
   steps:
-    # The tarball is keyed in alongside the lockfile: bumping the vendored CLI
-    # changes its hash, so a stale tree can never be restored over a new build.
-    - id: cache
-      uses: actions/cache@v4
-      with:
-        path: node_modules
-        key: ${{ runner.os }}-node22-${{ inputs.cache-scope }}-${{ hashFiles('package-lock.json', 'temp-cli/testdino-playwright-2.6.0.tgz') }}
-
-    - if: steps.cache.outputs.cache-hit != 'true'
-      shell: bash
+    - shell: bash
       run: npm ci --prefer-offline --no-audit --no-fund
 
     # package.json already carries the tarball as a `file:` dep, but installing it
     # by path as well means a stale lockfile cannot leave `npx tdpw` pointing at a
     # published build that does not understand `orchestrate`.
-    - if: steps.cache.outputs.cache-hit != 'true'
-      shell: bash
+    - shell: bash
       run: npm install --no-save --no-audit --no-fund "$CLI_TARBALL"
 
-    - if: inputs.install-browsers == 'true'
-      id: browsers
-      uses: actions/cache@v4
-      with:
-        path: ~/.cache/ms-playwright
-        key: ${{ runner.os }}-chromium-${{ inputs.cache-scope }}-${{ hashFiles('package-lock.json') }}
-
-    - if: inputs.install-browsers == 'true' && steps.browsers.outputs.cache-hit != 'true'
-      shell: bash
-      run: npx playwright install chromium
-
-    # Runs on cache hit too: the assertion is the only thing standing between a
-    # restored tree and a run that silently exercises the wrong CLI.
+    # The assertion is the only thing standing between a surprise resolution and a
+    # run that silently exercises the wrong CLI.
     - shell: bash
       run: |
         set -euo pipefail
