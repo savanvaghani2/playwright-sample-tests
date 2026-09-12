@@ -48,10 +48,10 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "api-lite = 4 api files (~20s); api-full adds the 80-case split-statuses; browser = TDV2-831 multi-project (slow)"
+        description: "all = every scenario in one run (~3m); api-lite = 4 api files (~20s); api-full adds the 80-case split-statuses; browser = TDV2-831 multi-project only"
         type: choice
-        default: "api-lite"
-        options: ["api-lite", "api-full", "browser"]
+        default: "all"
+        options: ["all", "api-lite", "api-full", "browser"]
       machines:
         description: "Machines to distribute across — you must have at least this many runners online"
         type: choice
@@ -72,7 +72,7 @@ env:
   # explicit URL wins over that mapping.
   TESTDINO_SERVER_URL: http://localhost:3005
   # The orch project's LOCAL token. A staging/prod token is a 401 here.
-  TESTDINO_TOKEN: ${{ secrets.TESTDINO_TOKEN_LOCAL || 'td_api_b88525977df5ca624a2e5f886c05ed5e225e078efba854846accdeb5126045f5' }}
+  TESTDINO_TOKEN: ${{ secrets.TESTDINO_TOKEN_LOCAL }}
   TD_ENV: local
   CLI_TARBALL: ./temp-cli/testdino-playwright-2.6.0.tgz
 
@@ -165,6 +165,19 @@ jobs:
               npx tdpw orchestrate discover --machines "$MACHINES" \
                 --project api --out master.json
               ;;
+            all)
+              # Every orchestration dimension in one run:
+              #   multi-project  chromium + firefox, so multi-browser.spec.js is
+              #                  TWO (file, project) units (TDV2-831)
+              #   >1 machine     13 units over the matrix, each machine gets work
+              #   workers        fullyParallel + workers>1, so a machine runs
+              #                  several tests at once (the W axis)
+              #   all outcomes   passed / failed / flaky+retry / skipped specs
+              #   idle tail      uneven file durations leave a machine waiting
+              # No --grep: the whole chromium+firefox set is the point.
+              npx tdpw orchestrate discover --machines "$MACHINES" \
+                --project chromium firefox --out master.json
+              ;;
             browser)
               # multi-browser.spec.js carries all five browser tags, so ONE file
               # yields TWO (file, project) units — the multi-project regression
@@ -226,7 +239,10 @@ jobs:
     # No `container:` — GitHub Actions does not support job containers on macOS
     # runners, and none is needed: the browsers are already installed on the Mac.
     runs-on: [self-hosted, testdino-local]
-    timeout-minutes: 2
+    # Generous: a cancelled machine drops its socket mid-batch, which the
+    # dispatcher reads as a crash and re-queues, so a tight cap manufactures
+    # the exact failure this workflow exists to observe.
+    timeout-minutes: 12
     strategy:
       # A machine that fails must NOT cancel its siblings: they are still holding
       # inflight specs, and cancelling them would crash-requeue that work.
@@ -245,7 +261,102 @@ jobs:
         # from the matrix. It MUST be unique per leg: two machines reporting the
         # same id collapse into one row in the per-machine breakdown and corrupt
         # the crash/attempt ledger, which is keyed on (spec, machineId).
+        env:
+          MODE: ${{ inputs.mode }}
         run: |
+          set -euo pipefail
+          # Workers is the INTRA-machine axis: one machine runs W tests at once.
+          # Capped for `all` because 3 machines x 5 workers is 15 concurrent
+          # browsers against the shared demo site, which fails tests for reasons
+          # unrelated to orchestration. 2 still exercises W>1. Harmless that
+          # discover recorded W=5 from the config: under fullyParallel the
+          # dispatcher hands out 1 spec regardless of W, so W only weighted LPT.
+          workers_args=()
+          if [ "$MODE" = "all" ]; then workers_args=(--workers=2); fi
+
           npx tdpw orchestrate run \
             --orchestration-id "${{ needs.discover.outputs.orchestration_id }}" \
-            --device-id "${{ matrix.machine }}"
+            --device-id "${{ matrix.machine }}" \
+            "${workers_args[@]}"
+
+  # Asserts the run actually exercised what the mode claims, straight from the
+  # local DB. Possible only because the runner IS the machine hosting the stack;
+  # a green matrix proves the machines exited, not that the data landed.
+  verify:
+    needs: [discover, machine]
+    if: always() && needs.discover.result == 'success'
+    runs-on: [self-hosted, testdino-local]
+    timeout-minutes: 3
+    steps:
+      - name: Assert the orchestration landed
+        env:
+          ORCH_ID: ${{ needs.discover.outputs.orchestration_id }}
+          SPEC_COUNT: ${{ needs.discover.outputs.spec_count }}
+          MODE: ${{ inputs.mode }}
+          MACHINES: ${{ inputs.machines }}
+        run: |
+          set -uo pipefail
+          psql() { docker exec ingestion-timescaledb psql -U postgres -d ingestion_dev -tAc "$1"; }
+
+          # The drain signal finalizes in seconds; the reaper fallback takes 15
+          # minutes, so poll rather than assume either.
+          run_id=""
+          for _ in $(seq 1 30); do
+            run_id=$(psql "SELECT id FROM test_runs WHERE orchestration_id='$ORCH_ID'" | tr -d '[:space:]')
+            [ -n "$run_id" ] && break
+            sleep 2
+          done
+          [ -n "$run_id" ] || { echo "::error::no test_runs row for $ORCH_ID — nothing reached the DB"; exit 1; }
+          echo "run_id=$run_id"
+
+          fail=0
+          check() { # name expected actual
+            if [ "$2" = "$3" ]; then echo "  ok    $1: $3"
+            else echo "::error::$1: got '$3', want '$2'"; fail=1; fi
+          }
+          atleast() {
+            if [ "$3" -ge "$2" ] 2>/dev/null; then echo "  ok    $1: $3 (>= $2)"
+            else echo "::error::$1: got '$3', want >= $2"; fail=1; fi
+          }
+
+          echo "── one merged run row, not one per machine ──"
+          check "rows for this orchestration" 1 \
+            "$(psql "SELECT count(*) FROM test_runs WHERE orchestration_id='$ORCH_ID'")"
+
+          echo "── every machine is attributed ──"
+          atleast "machines reporting cases" "$MACHINES" \
+            "$(psql "SELECT count(DISTINCT device_id) FROM test_cases WHERE run_id='$run_id' AND device_id IS NOT NULL")"
+          check "cases with no machine" 0 \
+            "$(psql "SELECT count(*) FROM test_cases WHERE run_id='$run_id' AND device_id IS NULL")"
+
+          echo "── per-machine buckets reconcile with the run header ──"
+          check "sum(machine tests) == header total" "$(psql "SELECT total_tests FROM test_runs WHERE id='$run_id'")" \
+            "$(psql "SELECT count(DISTINCT pw_test_id) FROM test_cases WHERE run_id='$run_id'")"
+
+          echo "── coverage integrity ──"
+          check "specs no machine could run" "" \
+            "$(psql "SELECT could_not_execute_specs FROM test_runs WHERE id='$run_id'" | tr -d '[:space:]')"
+
+          if [ "$MODE" = "all" ] || [ "$MODE" = "browser" ]; then
+            echo "── multi-project dispatch (TDV2-831) ──"
+            atleast "distinct playwright projects" 2 \
+              "$(psql "SELECT count(DISTINCT title_path->>1) FROM test_cases WHERE run_id='$run_id'")"
+          fi
+
+          if [ "$MODE" = "all" ]; then
+            echo "── the W axis: >1 test in flight on one machine ──"
+            atleast "max concurrent workers on a machine" 2 \
+              "$(psql "SELECT COALESCE(MAX(c),0) FROM (SELECT device_id, count(DISTINCT parallel_index) c FROM test_cases WHERE run_id='$run_id' GROUP BY device_id) w")"
+            echo "── retries reached the DB as extra attempts ──"
+            atleast "retry rows" 1 \
+              "$(psql "SELECT count(*) FROM test_cases WHERE run_id='$run_id' AND retry > 0")"
+            echo "── outcome variety ──"
+            atleast "distinct case statuses" 2 \
+              "$(psql "SELECT count(DISTINCT status) FROM test_cases WHERE run_id='$run_id' AND status IS NOT NULL")"
+          fi
+
+          echo
+          psql "SELECT device_id || '  ' || (title_path->>1) || '  tests=' || count(DISTINCT pw_test_id) || '  rows=' || count(*) FROM test_cases WHERE run_id='$run_id' GROUP BY 1,2 ORDER BY 1,2" \
+            | sed 's/^/  /'
+
+          exit $fail
