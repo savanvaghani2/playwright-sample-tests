@@ -16,11 +16,11 @@ cd "$(dirname "$0")/.."
 
 STAMP="${MATRIX_STAMP:-m$(date +%s)}"
 ONLY="${MATRIX_ONLY:-}"
-SPEC="${MATRIX_SPEC:-tests/split-statuses.spec.js}"
+SPEC="${MATRIX_SPEC:-tests/get-users.spec.js}"
 
 # The matrix proves TOPOLOGY (shard x split x workers), not status volume, so it
-# runs a small fast slice — 3 cases per status with a short hold. test:split keeps
-# the full 20-per-status set.
+# runs a small fast slice of the Split * suites (3 cases per status, short hold).
+# Dummyjson cases are grepped out so the matrix stays network-free.
 export SPLIT_CASES="${MATRIX_CASES:-3}"
 export SPLIT_STEP_MS="${MATRIX_STEP_MS:-120}"
 
@@ -42,17 +42,17 @@ leg() {
 echo "matrix stamp: $STAMP"
 
 # 1-2: plain run (no shard, no split), many vs one worker.
-wants 1 && leg "1 plain, workers=5" plain-w5 --workers=5
-wants 2 && leg "2 plain, workers=1" plain-w1 --workers=1
+wants 1 && leg "1 plain, workers=5" plain-w5 --workers=5 --grep "Split "
+wants 2 && leg "2 plain, workers=1" plain-w1 --workers=1 --grep "Split "
 
 # 3-4: sharded only.
 if wants 3; then
-  leg "3 sharded 1/2, workers=5" sh-w5 --workers=5 --shard=1/2
-  leg "3 sharded 2/2, workers=5" sh-w5 --workers=5 --shard=2/2
+  leg "3 sharded 1/2, workers=5" sh-w5 --workers=5 --shard=1/2 --grep "Split "
+  leg "3 sharded 2/2, workers=5" sh-w5 --workers=5 --shard=2/2 --grep "Split "
 fi
 if wants 4; then
-  leg "4 sharded 1/2, workers=1" sh-w1 --workers=1 --shard=1/2
-  leg "4 sharded 2/2, workers=1" sh-w1 --workers=1 --shard=2/2
+  leg "4 sharded 1/2, workers=1" sh-w1 --workers=1 --shard=1/2 --grep "Split "
+  leg "4 sharded 2/2, workers=1" sh-w1 --workers=1 --shard=2/2 --grep "Split "
 fi
 
 # A manual split hand-partitions the suite, so each leg must run a DISJOINT slice.

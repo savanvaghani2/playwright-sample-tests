@@ -4,7 +4,7 @@
 # Exercises the unsharded-split, sharded-split, and split-shard drill-down paths.
 #
 #   npm run test:split            clean group (no overlap)
-#   npm run test:split:overlap    split 3 re-runs split 1's spec -> overlapping
+#   npm run test:split:overlap    split 3 re-runs split 2's spec -> overlapping
 #                                 pw_test_ids, so ingestion raises
 #                                 split_anomaly_count and the run detail renders
 #                                 the "counts unreliable" banner
@@ -18,19 +18,17 @@ cd "$(dirname "$0")/.."
 SPLIT_ID="${SPLIT_ID:-local-$(date +%s)}"
 OVERLAP="${SPLIT_OVERLAP:-0}"
 
-# Status coverage: split-statuses.spec.js carries 20 cases in each terminal status
-# (passed/failed/flaky/skipped) and is network-free, so the whole group finishes
-# inside a minute while still running long enough to watch live. The demo-store
-# specs are too slow to hit that budget at this case count.
-# Split 2 (the sharded one) carries the status spec: 80 cases across 2 shards is
-# the case the per-shard live accordion exists for.
-SPLIT2_SPECS="tests/split-statuses.spec.js"
+# Status coverage lives on the four API specs (5 cases per status per file, so
+# failed/flaky/passed/skipped are even across dispatch units). Split 2 shards
+# get-users — the largest remaining file — so the per-shard live accordion still
+# has a real case split. The demo-store specs are too slow for this budget.
+SPLIT2_SPECS="tests/get-users.spec.js"
 
-# Split 3 duplicates split 1's spec in overlap mode: the same pw_test_ids arrive
+# Split 3 duplicates split 2's spec in overlap mode: the same pw_test_ids arrive
 # under two split indexes, which is exactly the anomaly the backend flags.
-SPLIT3_SPECS="tests/get-users.spec.js tests/delete-api.spec.js tests/updateUser.spec.js"
+SPLIT3_SPECS="tests/delete-api.spec.js tests/updateUser.spec.js"
 if [ "$OVERLAP" = "1" ]; then
-  SPLIT3_SPECS="tests/split-statuses.spec.js"
+  SPLIT3_SPECS="tests/get-users.spec.js"
 fi
 
 echo "split-id: $SPLIT_ID  (overlap=$OVERLAP)"

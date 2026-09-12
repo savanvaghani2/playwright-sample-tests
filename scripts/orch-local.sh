@@ -48,9 +48,9 @@ case "$MODE" in
     : "${MACHINES:=2}"
     ;;
   api)
-    # Five api specs, no browser. split-statuses.spec.js alone carries 80 cases in
-    # four terminal statuses and is network-free, so the whole group finishes in
-    # about a minute while still running long enough to watch the live view.
+    # Four api specs, no browser. Each file carries 5 cases in every terminal
+    # status (20 hold-based cases, failures included) plus its dummyjson tests,
+    # so machines get even work instead of one 80-case file pinning the wall clock.
     PROJECTS=(api)
     GREP=""
     : "${MACHINES:=3}"

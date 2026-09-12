@@ -37,18 +37,18 @@ name: TestDino orchestrate-mode (local, self-hosted)
 # The dispatch unit is (file, project): one file goes to ONE machine, so a single
 # slow file sets the wall-clock floor no matter how many machines you add. Timed
 # on this Mac at 5 workers:
-#     api project, all 5 files ......... 109 cases, 2m32s
-#       └ split-statuses.spec.js alone ... 80 cases, 219s of that 264s total
-#     the other 4 api files ............. 29 cases, ~45s (19s over 2 machines)
+#     api project, all 4 files ......... ~109 cases; hold-based status mix is
+#       5 passed / 5 failed / 5 flaky / 5 skipped per file so no one spec pins
+#       the wall clock
+#     api-lite (Users? API grep) ........ 29 dummyjson cases, ~45s
 #     chromium demo specs (passed/failed/flaky/skipped/multi-browser) .. 9m16s
-# api-lite therefore excludes split-statuses: it is 83% of the api cost sitting in
-# one indivisible unit.
+# api-lite therefore excludes the Split * Suite describes via grep.
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "all = orchestration + a sibling sharded run (~3m); api-lite = 4 api files (~20s); api-full adds the 80-case split-statuses; browser = TDV2-831 multi-project only; shards = the sharded path alone"
+        description: "all = orchestration + a sibling sharded run (~3m); api-lite = dummyjson cases only (~20s); api-full = 4 api files with even status mix; browser = TDV2-831 multi-project only; shards = the sharded path alone"
         type: choice
         default: "all"
         options: ["all", "api-lite", "api-full", "browser", "shards"]
@@ -159,10 +159,9 @@ jobs:
           # so the spec set is chosen by filter, never by path.
           case "$MODE" in
             api-lite)
-              # There is no --grep-invert, so split-statuses is excluded by a
-              # positive pattern instead: every one of the four API describes ends
-              # in "User API"/"Users API", and the split suites ("Split Passed
-              # Suite", …) match none of it. 29 cases, 4 dispatch units.
+              # There is no --grep-invert, so the Split * Suite describes are
+              # excluded by a positive pattern: every dummyjson describe ends in
+              # "User API"/"Users API". 29 cases, 4 dispatch units.
               npx tdpw orchestrate discover --machines "$MACHINES" \
                 --project api --grep "Users? API" --out master.json
               ;;

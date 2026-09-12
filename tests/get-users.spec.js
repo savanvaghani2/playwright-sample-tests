@@ -1,5 +1,6 @@
 // @ts-check
 import { expect, test } from './support/test.js';
+import { splitStatusSuites } from './support/splitStatuses.js';
 
 const API_BASE_URL = process.env.API_BASE_URL || 'https://dummyjson.com';
 const USERS_ENDPOINT = '/users';
@@ -363,3 +364,16 @@ test.describe('GET Users API', () => {
     },
   );
 });
+
+// Registered here, not in the helper: Playwright takes a test's location from
+// the call stack of test(), and a shared registrar made all 80 cases look like
+// they lived in support/splitStatuses.js — which `orchestrate discover` queued
+// as a dispatch unit no machine can execute, finalizing every run `incomplete`.
+for (const suite of splitStatusSuites('GET')) {
+  test.describe(suite.name, { tag: '@api' }, () => {
+    for (const testCase of suite.cases) {
+      if (suite.skip) test.skip(testCase.title, testCase.annotation, testCase.body);
+      else test(testCase.title, testCase.annotation, testCase.body);
+    }
+  });
+}
