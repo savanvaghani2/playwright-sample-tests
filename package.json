@@ -31,7 +31,7 @@
     "vite-plugin-istanbul": "^7.0.12"
   },
   "dependencies": {
-    "@testdino/playwright": "^2.5.0",
+    "@testdino/playwright": "^2.6.1",
     "playwright": "^1.62.1"
   }
 }
