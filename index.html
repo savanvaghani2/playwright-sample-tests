@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TestDino Coverage Demo</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        max-width: 40rem;
+        margin: 2rem auto;
+        padding: 0 1rem;
+      }
+      button {
+        margin-right: 0.5rem;
+        margin-top: 0.5rem;
+      }
+      #status {
+        margin-top: 1rem;
+        padding: 0.75rem;
+        border: 1px solid #ccc;
+        border-radius: 0.25rem;
+      }
+    </style>
+  </head>
+  <body>
+    <h1 data-testid="coverage-title">TestDino Coverage Demo</h1>
+    <p data-testid="greeting">Hello</p>
+    <p data-testid="sum">0</p>
+    <button type="button" data-testid="increment-btn">Increment</button>
+    <button type="button" data-testid="reset-btn">Reset</button>
+    <button type="button" data-testid="greet-btn">Greet</button>
+    <div id="status" data-testid="status">Ready</div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

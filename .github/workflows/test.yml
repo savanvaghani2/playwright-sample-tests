@@ -1,204 +1,64 @@
-# name: Run Playwright tests
-
-# on:
-#   push:
-#   pull_request:
-#   schedule:
-#     - cron: '30 3 * * 1-5' # 11:00 AM IST
-#   workflow_dispatch:
-
-# jobs:
-#   run-tests:
-#     name: Run Playwright tests ${{ matrix.shardIndex }}/3
-#     runs-on: ubuntu-latest
-
-#     strategy:
-#       fail-fast: false
-#       matrix:
-#         shardIndex: [1, 2, 3]
-#         shardTotal: [3]
-
-#     steps:
-#       - uses: actions/checkout@v4
-
-#       # ✅ REQUIRED: Node 20
-#       - name: Setup Node.js 20.x
-#         uses: actions/setup-node@v3
-#         with:
-#           node-version: '20'
-
-#       - name: Create .env file
-#         run: |
-#           echo "USERNAME=${{ secrets.USERNAME }}" >> .env
-#           echo "PASSWORD=${{ secrets.PASSWORD }}" >> .env
-#           echo "NEW_PASSWORD=${{ secrets.NEW_PASSWORD }}" >> .env
-#           echo "FIRST_NAME=${{ secrets.FIRST_NAME }}" >> .env
-#           echo "STREET_NAME=${{ secrets.STREET_NAME }}" >> .env
-#           echo "CITY=${{ secrets.CITY }}" >> .env
-#           echo "STATE=${{ secrets.STATE }}" >> .env
-#           echo "COUNTRY=${{ secrets.COUNTRY }}" >> .env
-#           echo "ZIP_CODE=${{ secrets.ZIP_CODE }}" >> .env
-
-#       - name: Cache npm dependencies
-#         uses: actions/cache@v3
-#         with:
-#           path: ~/.npm
-#           key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
-#           restore-keys: |
-#             ${{ runner.os }}-node-
-
-#       - name: Install deps + browsers
-#         run: |
-#           npm ci
-#           npx playwright install --with-deps chromium firefox webkit
-
-#       # ✅ FULL + RERUN LOGIC
-#       - name: Run Playwright (rerun failed tests if applicable)
-#         env:
-#           TESTDINO_TOKEN: ${{ secrets.TESTDINO_TOKEN }}
-#           SHARD_INDEX: ${{ matrix.shardIndex }}
-#           SHARD_TOTAL: ${{ matrix.shardTotal }}
-#         run: |
-#           echo "GitHub run attempt: ${{ github.run_attempt }}"
-
-#           if [[ "${{ github.run_attempt }}" -gt 1 ]]; then
-#             echo "Detected re-run. Checking failed test metadata from TestDino."
-
-#             npx tdpw last-failed \
-#               --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }} \
-#               > last-failed-flags.txt
-
-#             EXTRA_PW_FLAGS="$(cat last-failed-flags.txt)"
-
-#             if [[ -n "$EXTRA_PW_FLAGS" ]]; then
-#               echo "Running only failed tests for this shard:"
-#               echo "$EXTRA_PW_FLAGS"
-
-#               # IMPORTANT: JSON + BLOB BOTH REQUIRED
-#               # Ensure playwright-report directory exists
-#               mkdir -p ./playwright-report
-#               eval "npx playwright test $EXTRA_PW_FLAGS"
-#               exit 0
-#             fi
-
-#             echo "No failed test metadata found. Falling back to full shard."
-#           fi
-
-#           # First run (full shard)
-#           # Ensure playwright-report directory exists
-#           mkdir -p ./playwright-report
-#           npx playwright test \
-#             --grep="@chromium|@firefox|@webkit|@android|@ios" \
-#             --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }}
-
-#       - name: Upload blob report
-#         if: ${{ !cancelled() }}
-#         uses: actions/upload-artifact@v4
-#         with:
-#           name: blob-report-${{ matrix.shardIndex }}
-#           path: ./blob-report
-#           retention-days: 1
-
-#       # ✅ THIS WILL SHOW "Metadata cached successfully ✔" WHEN JSON EXISTS
-#       - name: Cache tdpw last failed metadata
-#         if: always()
-#         env:
-#           TESTDINO_TOKEN: ${{ secrets.TESTDINO_TOKEN }}
-#           SHARD_INDEX: ${{ matrix.shardIndex }}
-#           SHARD_TOTAL: ${{ matrix.shardTotal }}
-#         run: |
-#           npx tdpw cache --verbose
-
-#   merge-reports:
-#     name: Merge Reports
-#     needs: run-tests
-#     if: always()
-#     runs-on: ubuntu-latest
-
-#     steps:
-#       - uses: actions/checkout@v4
-
-#       # ✅ Node 20 here as well
-#       - name: Setup Node.js 20.x
-#         uses: actions/setup-node@v3
-#         with:
-#           node-version: '20'
-
-#       - name: Cache npm dependencies
-#         uses: actions/cache@v3
-#         with:
-#           path: ~/.npm
-#           key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
-#           restore-keys: |
-#             ${{ runner.os }}-node-
-
-#       - name: Install deps + browsers
-#         run: |
-#           npm ci
-#           npx playwright install --with-deps
-
-#       - name: Download all blob reports
-#         uses: actions/download-artifact@v4
-#         with:
-#           path: ./all-blob-reports
-#           pattern: blob-report-*
-#           merge-multiple: true
-
-#       - name: Merge HTML & JSON reports
-#         run: npx playwright merge-reports --config=playwright.config.js ./all-blob-reports
-
-#       - name: Upload combined report
-#         uses: actions/upload-artifact@v4
-#         with:
-#           name: Playwright Test Report
-#           path: ./playwright-report
-#           retention-days: 14
-
-#       - name: Send TestDino report
-#         run: |
-#           npx --yes tdpw ./playwright-report \
-#             --token="${{ secrets.TESTDINO_TOKEN }}" \
-#             --upload-html \
-#             --upload-traces \
-#             --verbose
-
-
-
-
-
-# .github/workflows/playwright-daily.yml
-# Runs Playwright test shards every day at **11 : 42 AM IST** (06 : 12 UTC)
-# plus anytime you trigger it manually from the Actions tab.
-
 name: Run Playwright tests
 
 on:
-  push:          # runs on every push
-  pull_request:  # runs on new PRs or PR updates
+  push: # runs on every push
+  pull_request: # runs on new PRs or PR updates
   schedule:
     - cron: '30 3 * * 1-5'
   workflow_dispatch:
+    inputs:
+      td_env:
+        description: Which TestDino to report to
+        type: choice
+        default: staging
+        options: [staging, prod, local]
+      testdino_rerun_of:
+        description: Source run id, when this run re-runs another run's tests
+        required: false
+      testdino_rerun_args:
+        description: Which of that run's tests (--scope / --test-ids / --exclude-ids)
+        required: false
 
 jobs:
   run-tests:
-    name: Run shard ${{ matrix.shardIndex }}/5
+    name: Run shard ${{ matrix.shardIndex }}/${{ matrix.shardTotal }}
     runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:v1.61.0-noble
+      options: --user root
 
     strategy:
       fail-fast: false
       matrix:
-        shardIndex: [1,2,3,4,5] 
+        shardIndex: [1, 2, 3, 4, 5]
         shardTotal: [5]
 
+    env:
+      # TD_ENV is the single switch; playwright.config.js turns it into a URL —
+      # including the ngrok tunnel for `local`, which a runner cannot reach
+      # otherwise. dotenv never overrides a variable already in the environment,
+      # so this wins over any .env the job writes.
+      # A dashboard-dispatched re-run carries no td_env — the integration service
+      # only sends the two rerun inputs — so it would silently land on staging.
+      # While the dashboard doing the dispatching is the local one, a re-run means
+      # local. Drop this clause once the dispatcher names its own server.
+      TD_ENV: ${{ inputs.td_env || (inputs.testdino_rerun_of != '' && 'local') || 'staging' }}
+      # Must mirror the TD_ENV condition above exactly — GitHub cannot reference
+      # one env value from another, and a token from the wrong environment is a
+      # 401 rather than a visible misconfiguration.
+      TESTDINO_TOKEN: ${{ (inputs.td_env == 'local' || (inputs.td_env == '' && inputs.testdino_rerun_of != '')) && secrets.TESTDINO_TOKEN_LOCAL || secrets.TESTDINO_TOKEN }}
+      TESTDINO_CI_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Setup Node.js 18.x
-        uses: actions/setup-node@v3
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '20'
 
-      - name: Create .env file
+      - name: Create .env
         run: |
           echo "USERNAME=${{ secrets.USERNAME }}" >> .env
           echo "PASSWORD=${{ secrets.PASSWORD }}" >> .env
@@ -209,93 +69,31 @@ jobs:
           echo "STATE=${{ secrets.STATE }}" >> .env
           echo "COUNTRY=${{ secrets.COUNTRY }}" >> .env
           echo "ZIP_CODE=${{ secrets.ZIP_CODE }}" >> .env
-     
-      - name: Cache npm dependencies
-        uses: actions/cache@v3
-        with:
-          path: ~/.npm
-          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-
 
-      - name: Install deps + browsers
-        run: |
-          npm ci
-          npx playwright install --with-deps chromium firefox webkit
-
-      - name: List Playwright projects (debug)
-        run: npx playwright list --projects | cat
-
-      - name: Run shard ${{ matrix.shardIndex }} 
-        run: npx playwright test --grep="@chromium|@firefox|@webkit|@android|@ios" --reporter=blob --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }}
-
-      - name: Upload blob report
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: blob-report-${{ matrix.shardIndex }}
-          path: ./blob-report
-          retention-days: 1
-
-  merge-reports:
-    name: Merge Reports
-    needs: run-tests
-    if: always()             # run even if some shards fail
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js 18.x
-        uses: actions/setup-node@v3
-        with:
-          node-version: '18'
-
-      - name: Cache npm dependencies
-        uses: actions/cache@v3
-        with:
-          path: ~/.npm
-          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-
-
-      - name: Install deps + browsers
+      - name: Install dependencies
         run: |
           npm ci
           npx playwright install --with-deps
 
-      - name: Download all blob reports
-        uses: actions/download-artifact@v4
-        with:
-          path: ./all-blob-reports
-          pattern: blob-report-*
-          merge-multiple: true
-
-      - name: Merge HTML & JSON reports
-        run: npx playwright merge-reports --config=playwright.config.js ./all-blob-reports
-
-      - name: Upload combined report
-        uses: actions/upload-artifact@v4
-        with:
-          name: Playwright Test Report
-          path: ./playwright-report
-          retention-days: 14
-
-      # - name: Send TestDino report
-      #   env:
-      #     NODE_ENV: staging
-      #   # run: |
-      #   #  npx --yes tdpw ./playwright-report \
-      #   #    --token="${{ secrets.TESTDINO_TOKEN }}" \
-      #   #    --upload-html \
-      #   #    --upload-traces \
-      #   #    --verbose
-      - name: Send TestDino report
-        #env:
-         # NODE_ENV: staging
+      # One place decides the URL: the config. Exporting it here is only so the
+      # CLI's own calls (auth, test selection) agree with the reporter's.
+      - name: Resolve the TestDino server from TD_ENV
         run: |
-          TESTDINO_RUNTIME="staging" npx --yes tdpw ./playwright-report \
-           --token="${{ secrets.TESTDINO_TOKEN }}" \
-           --upload-html \
-           --upload-traces \
-           --verbose
+          [ -n "${TESTDINO_TOKEN:-}" ] || { echo "::error::No token for TD_ENV=$TD_ENV"; exit 1; }
+          URL=$(node --input-type=module -e "
+            const m = await import('./playwright.config.js');
+            process.stdout.write(m.default.reporter[0][1].serverUrl);
+          ")
+          echo "Reporting to $URL (TD_ENV=$TD_ENV)"
+          echo "TESTDINO_SERVER_URL=$URL" >> "$GITHUB_ENV"
+
+      - name: Run Playwright tests
+        run: |
+          npx tdpw test \
+            --ci-run-id "$TESTDINO_CI_RUN_ID" \
+            --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }} \
+            --workers=5 \
+            ${RERUN_OF:+--last-failed --from-run "$RERUN_OF" $RERUN_ARGS}
+        env:
+          RERUN_OF: ${{ inputs.testdino_rerun_of }}
+          RERUN_ARGS: ${{ inputs.testdino_rerun_args }}

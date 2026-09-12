@@ -1,0 +1,88 @@
+name: TestDino split-mode (staging)
+
+# Manual validation of TestDino splitted mode against STAGING with a MIX of
+# sharded and unsharded splits. One workflow run == one logical split group.
+# The local equivalent is scripts/split-local.sh (npm run test:split).
+
+on:
+  workflow_dispatch: {}
+
+# Never cancel a split group mid-flight: a cancelled leg would leave the group
+# with a missing split, and it only finalizes once the idle reaper fires.
+concurrency:
+  group: testdino-split-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  TESTDINO_SERVER_URL: ${{ secrets.TESTDINO_STAGING_URL }}
+  TESTDINO_TOKEN: ${{ secrets.TESTDINO_STAGING_TOKEN }}
+
+jobs:
+  # Fail fast if staging is unreachable or the key is wrong, before spending
+  # runner time on browsers. Never print the auth body: it carries Kafka SASL
+  # credentials that must not land in CI logs.
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify staging reporter is reachable
+        run: |
+          set -uo pipefail
+          [ -n "${TESTDINO_SERVER_URL:-}" ] || { echo "::error::TESTDINO_STAGING_URL secret is not set"; exit 1; }
+          [ -n "${TESTDINO_TOKEN:-}" ] || { echo "::error::TESTDINO_STAGING_TOKEN secret is not set"; exit 1; }
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -X POST "$TESTDINO_SERVER_URL/api/v1/reporter/auth" \
+            -H "Authorization: Bearer $TESTDINO_TOKEN" \
+            -H "Content-Type: application/json" -d '{}' || echo 000)
+          echo "reporter/auth -> HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "::error::reporter auth failed ($code). Check TESTDINO_STAGING_URL + TESTDINO_STAGING_TOKEN, and that stg-data-handler advertises a PUBLIC KAFKA_CLI_BROKERS reachable from GitHub runners."
+            exit 1
+          fi
+          echo "Reporter auth OK. (Broker + SASL config intentionally not printed: it contains credentials.)"
+
+  split:
+    needs: preflight
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    container:
+      # Browsers are baked into this image, so no `playwright install` step.
+      # Keep the version in sync with @playwright/test in package-lock.json.
+      image: mcr.microsoft.com/playwright:v1.57.0-noble
+    # One split leg per matrix entry. Splits 1 and 3 are UNSHARDED; split 2 is
+    # SHARDED across two legs. All legs share one split-id (one logical run);
+    # each split has its own ci-run-id so split 2's shards merge into split 2,
+    # and only split 2.
+    strategy:
+      fail-fast: false # a failing split must NOT cancel its siblings
+      # Serialize legs: 4 concurrent logins overwhelm the external demo site and
+      # one leg's globalSetup times out, leaving that split/shard with 0 tests.
+      max-parallel: 1
+      matrix:
+        include:
+          - { name: "split 1/3 (unsharded)", split: "1/3", ci: "1", shard: "",    project: "api",      specs: "tests/post-api.spec.js" }
+          - { name: "split 2/3 shard 1/2",   split: "2/3", ci: "2", shard: "1/2", project: "chromium", specs: "tests/passed-tests.spec.js" }
+          - { name: "split 2/3 shard 2/2",   split: "2/3", ci: "2", shard: "2/2", project: "chromium", specs: "tests/passed-tests.spec.js" }
+          - { name: "split 3/3 (unsharded)", split: "3/3", ci: "3", shard: "",    project: "api",      specs: "tests/get-users.spec.js tests/delete-api.spec.js" }
+    env:
+      # Shared across every leg of THIS run -> one aggregated logical run. run_id
+      # is stable across all matrix jobs; run_attempt keeps re-runs distinct.
+      SPLIT_ID: "gh-${{ github.run_id }}-${{ github.run_attempt }}"
+      HOME: /root # the playwright image runs as root; browsers live under /root
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      # Installs the repo's vendored @testdino/playwright (file: dep) so `npx tdpw`
+      # is the CLI that understands --split, not the stale public package.
+      - run: npm ci
+      - name: Run ${{ matrix.name }}
+        run: |
+          npx tdpw test \
+            --split ${{ matrix.split }} \
+            --split-id "$SPLIT_ID" \
+            --ci-run-id "$SPLIT_ID-${{ matrix.ci }}" \
+            ${{ matrix.shard && format('--shard={0}', matrix.shard) || '' }} \
+            --project=${{ matrix.project }} \
+            ${{ matrix.specs }}
