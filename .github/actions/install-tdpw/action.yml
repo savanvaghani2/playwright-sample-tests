@@ -5,6 +5,13 @@ description: >
   workflow's 2-minute budget, so the cache is what makes the target reachable.
 
 inputs:
+  install-browsers:
+    description: >
+      Install Chromium. Required even for the api project: its specs import from
+      tests/support/test.js, which re-exports @testdino/playwright and brings an
+      auto `page` fixture with it — so every api test launches a browser. Set
+      false only inside the Playwright container, which already ships them.
+    default: "true"
   cache-scope:
     description: >
       Separates caches built on the runner host from ones built inside the
@@ -33,6 +40,17 @@ runs:
     - if: steps.cache.outputs.cache-hit != 'true'
       shell: bash
       run: npm install --no-save --no-audit --no-fund "$CLI_TARBALL"
+
+    - if: inputs.install-browsers == 'true'
+      id: browsers
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/ms-playwright
+        key: ${{ runner.os }}-chromium-${{ inputs.cache-scope }}-${{ hashFiles('package-lock.json') }}
+
+    - if: inputs.install-browsers == 'true' && steps.browsers.outputs.cache-hit != 'true'
+      shell: bash
+      run: npx playwright install chromium
 
     # Runs on cache hit too: the assertion is the only thing standing between a
     # restored tree and a run that silently exercises the wrong CLI.

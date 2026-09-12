@@ -69,10 +69,6 @@ env:
   TESTDINO_TOKEN: ${{ secrets.TESTDINO_TOKEN_LOCAL || 'td_api_b88525977df5ca624a2e5f886c05ed5e225e078efba854846accdeb5126045f5' }}
   TD_ENV: local
   CLI_TARBALL: ./temp-cli/testdino-playwright-2.6.0.tgz
-  # `playwright` is a runtime dep, so npm ci runs its browser-download postinstall
-  # (~30s) even for api specs that never open a browser. Only browser mode needs
-  # it, and there the container already ships them.
-  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
 
 jobs:
   # Preflight is folded in here rather than living in its own job: a separate job
@@ -133,6 +129,9 @@ jobs:
         with:
           node-version: 22
       - uses: ./.github/actions/install-tdpw
+        with:
+          # discover only lists the test set; nothing here opens a browser.
+          install-browsers: "false"
 
       - name: Mint the orchestration
         id: mint
@@ -243,6 +242,9 @@ jobs:
       - uses: ./.github/actions/install-tdpw
         with:
           cache-scope: ${{ inputs.mode == 'browser' && 'container' || 'host' }}
+          # The container bakes its own browsers; installing again would just
+          # duplicate them under a different root.
+          install-browsers: ${{ inputs.mode == 'browser' && 'false' || 'true' }}
       - name: Join ${{ needs.discover.outputs.orchestration_id }} as ${{ matrix.machine }}
         # GitHub Actions has no native per-machine index, so the device id comes
         # from the matrix. It MUST be unique per leg: two machines reporting the
