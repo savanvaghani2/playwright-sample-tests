@@ -1,7 +1,6 @@
 name: TestDino re-run (local, self-hosted)
 
-# Proves the ONE thing that separates the two re-run flows: which commit's code
-# actually executes.
+# The two re-run flows, differing in one thing: which commit's code executes.
 #
 #   testdino_rerun_sha set   → SAME-COMMIT re-run. Runs the source run's own
 #                              commit, so a test that now passes was flaky
@@ -9,54 +8,63 @@ name: TestDino re-run (local, self-hosted)
 #   testdino_rerun_sha empty → LATEST re-run. Runs the tip of the branch, to
 #                              check whether a fix worked.
 #
-# The pin cannot travel as the dispatch `ref`: GitHub's workflow_dispatch takes
-# only a branch or tag there and resolves it to that branch's TIP at dispatch
-# time. So it arrives as this input and the checkout step below applies it. A
-# workflow that declares the input and does not use it is worse than one that
-# never declared it — the dispatch is accepted, the branch tip runs, and the
-# result is still recorded as a re-run of the original.
+# The pin cannot travel as the dispatch `ref`: workflow_dispatch accepts only a
+# branch or tag there and resolves it to that branch's TIP at dispatch time. So
+# it arrives as an input and the checkout step applies it. A workflow that
+# declares the input and never uses it is worse than one that never declared
+# it — the dispatch is accepted, the branch tip runs, and the result is still
+# recorded as a re-run of the original.
+#
+# The four input names are the dashboard's contract, not ours: the integration
+# service reads this file, sends only the inputs it finds declared, and hides
+# the workflow from the re-run sheet entirely without testdino_rerun_from.
 #
 # Self-hosted on purpose: the reporter sends results to what the server
 # advertises (localhost:3004 / :19092), so only a runner ON the Mac running the
 # stack can deliver them. See testdino-orchestrate-staging.yml for the full why.
 #
-# The test SELECTION inputs (testdino_rerun_from / _scope / _test_ids /
-# _exclude_ids) are deliberately NOT declared here: the vendored CLI is 2.6.0,
-# which has no `--rerun`, and declaring an input this workflow cannot honour is
-# the exact failure described above. Selection is a separate axis and identical
-# in both flows.
+# Pinned to the vendored CLI 2.7.0, not the 2.6.0 the other workflows use:
+# `--rerun` does not exist below it, and a published `npx tdpw` fails with
+# `unknown option '--rerun'`.
 
 on:
   workflow_dispatch:
     inputs:
+      testdino_rerun_from:
+        description: Source run id, when this run re-runs another run's tests
+        required: false
+      testdino_rerun_scope:
+        description: Which of that run's tests to re-run
+        type: choice
+        default: failed
+        options: [failed, flaky, all]
+      testdino_rerun_test_ids:
+        description: Comma-separated test ids, for an exact selection
+        required: false
+      testdino_rerun_exclude_ids:
+        description: Comma-separated test ids to drop from the scope
+        required: false
       testdino_rerun_sha:
         description: Commit to check out. Set = same-commit re-run; empty = latest on the branch.
         required: false
-      spec:
-        description: Which spec to run (kept small so the two dispatches are quick to compare)
-        type: choice
-        default: tests/get-users.spec.js
-        options:
-          - tests/get-users.spec.js
-          - tests/post-api.spec.js
 
 env:
   TESTDINO_SERVER_URL: http://localhost:3005
   TESTDINO_TOKEN: ${{ secrets.TESTDINO_TOKEN_LOCAL }}
-  CLI_TARBALL: ./temp-cli/testdino-playwright-2.6.0.tgz
+  CLI_TARBALL: ./temp-cli/testdino-playwright-2.7.0.tgz
 
 jobs:
   rerun:
     name: ${{ inputs.testdino_rerun_sha != '' && 'same-commit' || 'latest' }}
     runs-on: [self-hosted, testdino-local]
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.testdino_rerun_sha || github.sha }}
 
       # The assertion, not the echo, is the point: a pin that silently failed to
-      # apply would otherwise look exactly like a successful same-commit re-run.
+      # apply looks exactly like a successful same-commit re-run.
       - name: Assert the pin took effect
         run: |
           set -euo pipefail
@@ -75,18 +83,45 @@ jobs:
             echo "mode        : latest"
             [ "$head" = "$tip" ] || { echo "::error::expected the branch tip $tip, got $head"; exit 1; }
           fi
-          echo "specs present at this commit:"
-          ls tests/*.spec.js | sed 's/^/  /'
 
       - uses: actions/setup-node@v6
         with:
           node-version: 22
 
-      - uses: ./.github/actions/install-tdpw
+      # Not ./.github/actions/install-tdpw: that action asserts 2.6.0, which the
+      # other workflows depend on. This one needs 2.7.0 for `--rerun`.
+      - name: Install deps and the vendored tdpw 2.7.0
+        run: |
+          set -euo pipefail
+          npm ci --prefer-offline --no-audit --no-fund
+          npm install --no-save --no-audit --no-fund "$CLI_TARBALL"
+          got=$(npx tdpw --version | tail -1 | tr -d '[:space:]')
+          echo "tdpw $got"
+          [ "$got" = "2.7.0" ] || { echo "::error::expected the vendored tdpw 2.7.0, got '$got'"; exit 1; }
 
       - name: Run the tests at the checked-out commit
+        env:
+          RERUN_FROM: ${{ inputs.testdino_rerun_from }}
+          RERUN_SCOPE: ${{ inputs.testdino_rerun_scope }}
+          RERUN_TEST_IDS: ${{ inputs.testdino_rerun_test_ids }}
+          RERUN_EXCLUDE_IDS: ${{ inputs.testdino_rerun_exclude_ids }}
         run: |
-          npx tdpw test \
-            --ci-run-id "rerun-${{ github.run_id }}-${{ github.run_attempt }}" \
-            --project=api \
-            ${{ inputs.spec }}
+          # --rerun carries the scope as its value (failed|flaky|all) and needs
+          # --from-run; the id selections are their own flags. `if`, not `&&`:
+          # Actions runs this with `bash -e`, where a false test as the last
+          # command of a line fails the whole step.
+          set -- --ci-run-id "rerun-${{ github.run_id }}-${{ github.run_attempt }}"
+          if [ -n "${RERUN_FROM:-}" ]; then
+            set -- "$@" --rerun "${RERUN_SCOPE:-failed}" --from-run "$RERUN_FROM"
+            if [ -n "${RERUN_TEST_IDS:-}" ]; then
+              set -- "$@" --test-ids "$RERUN_TEST_IDS"
+            fi
+            if [ -n "${RERUN_EXCLUDE_IDS:-}" ]; then
+              set -- "$@" --exclude-ids "$RERUN_EXCLUDE_IDS"
+            fi
+          else
+            # No source run: a plain baseline over the api project, which is what
+            # produces the failures a later re-run selects from.
+            set -- "$@" --project=api tests/get-users.spec.js
+          fi
+          npx tdpw test "$@"
