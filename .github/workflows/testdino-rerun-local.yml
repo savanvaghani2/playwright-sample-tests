@@ -84,6 +84,19 @@ jobs:
             [ "$head" = "$tip" ] || { echo "::error::expected the branch tip $tip, got $head"; exit 1; }
           fi
 
+      # The pin moves the whole worktree back, tooling included — the CLI
+      # tarball this job needs was committed AFTER most commits it can be asked
+      # to pin, so at those commits it simply is not on disk. Only the TESTS are
+      # meant to be pinned; the harness that runs them is not part of the code
+      # under test, and the pinned commit's lockfile pins a CLI with no --rerun
+      # at all. So restore just this directory from the branch tip.
+      - name: Restore the vendored CLI from the branch tip
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin main
+          git checkout FETCH_HEAD -- temp-cli
+          ls -la temp-cli/*.tgz
+
       - uses: actions/setup-node@v6
         with:
           node-version: 22
