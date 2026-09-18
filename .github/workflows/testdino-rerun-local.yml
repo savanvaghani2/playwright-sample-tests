@@ -37,7 +37,7 @@ on:
         description: Which of that run's tests to re-run
         type: choice
         default: failed
-        options: [failed, flaky, all]
+        options: [failed, flaky, failed-and-flaky]
       testdino_rerun_test_ids:
         description: Comma-separated test ids, for an exact selection
         required: false
@@ -119,7 +119,7 @@ jobs:
           RERUN_TEST_IDS: ${{ inputs.testdino_rerun_test_ids }}
           RERUN_EXCLUDE_IDS: ${{ inputs.testdino_rerun_exclude_ids }}
         run: |
-          # --rerun carries the scope as its value (failed|flaky|all) and needs
+          # --rerun carries the scope as its value (failed|flaky|failed-and-flaky) and needs
           # --from-run; the id selections are their own flags. `if`, not `&&`:
           # Actions runs this with `bash -e`, where a false test as the last
           # command of a line fails the whole step.
