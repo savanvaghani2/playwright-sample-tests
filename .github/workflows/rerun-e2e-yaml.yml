@@ -1,0 +1,135 @@
+name: Re-run e2e (with YAML change)
+
+# The customer shape for the dispatch re-run: the testdino_rerun_* inputs and the
+# checkout pin from microservices docs/RERUN_FAILED_TESTS.md §6.3. A dispatched
+# re-run is one unsharded job (`--rerun` refuses --shard/--split).
+# docs/RERUN_E2E_TEST_PLAN.md §5.2.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "staging | local; empty = repo variable RERUN_E2E_TARGET, else staging (a TestDino dispatch sends only testdino_* inputs)"
+        required: false
+      shape:
+        type: choice
+        options: [single, sharded, split]
+        default: single
+      mode:
+        description: Probe outcomes (tests/rerun-e2e.spec.js)
+        type: choice
+        options: [mixed, recover-only, flaky-only, nontest-fail]
+        default: mixed
+      testdino_rerun_from:
+        required: false
+      testdino_rerun_scope:
+        default: failed
+      testdino_rerun_test_ids:
+        required: false
+      testdino_rerun_exclude_ids:
+        required: false
+      testdino_rerun_sha:
+        required: false
+      testdino_rerun_tags:
+        required: false
+
+jobs:
+  plan:
+    runs-on: [self-hosted, "testdino-${{ (inputs.target || vars.RERUN_E2E_TARGET || 'staging') == 'local' && 'local' || 'stg' }}"]
+    outputs:
+      legs: ${{ steps.legs.outputs.legs }}
+    steps:
+      - id: legs
+        env:
+          SHAPE: ${{ inputs.shape }}
+          TD_RERUN_FROM: ${{ inputs.testdino_rerun_from }}
+        run: |
+          if [ -n "$TD_RERUN_FROM" ]; then
+            legs='[{"name":"rerun","ci":"1"}]'
+          else
+            case "$SHAPE" in
+              single)  legs='[{"name":"single","ci":"1","grep":"@rerun-e2e"}]' ;;
+              sharded) legs='[{"name":"shard 1/4","ci":"1","grep":"@rerun-e2e","shard":"1/4"},{"name":"shard 2/4","ci":"1","grep":"@rerun-e2e","shard":"2/4"},{"name":"shard 3/4","ci":"1","grep":"@rerun-e2e","shard":"3/4"},{"name":"shard 4/4","ci":"1","grep":"@rerun-e2e","shard":"4/4"}]' ;;
+              split)   legs='[{"name":"split 1/3","ci":"1","split":"1/3","grep":"flaky-a|pass-[12]"},{"name":"split 2/3 shard 1/2","ci":"2","split":"2/3","shard":"1/2","grep":"recover|sticky|pass-[345]"},{"name":"split 2/3 shard 2/2","ci":"2","split":"2/3","shard":"2/2","grep":"recover|sticky|pass-[345]"},{"name":"split 3/3","ci":"3","split":"3/3","grep":"pass-[678]"}]' ;;
+              *) echo "::error::unknown shape $SHAPE"; exit 1 ;;
+            esac
+          fi
+          echo "legs=$legs" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: plan
+    name: ${{ matrix.name }}
+    runs-on: [self-hosted, "testdino-${{ (inputs.target || vars.RERUN_E2E_TARGET || 'staging') == 'local' && 'local' || 'stg' }}"]
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.legs) }}
+    env:
+      TD_ENV: ${{ inputs.target || vars.RERUN_E2E_TARGET || 'staging' }}
+      TESTDINO_SERVER_URL: ${{ (inputs.target || vars.RERUN_E2E_TARGET || 'staging') == 'local' && 'http://localhost:3005' || secrets.TESTDINO_STAGING_URL }}
+      TESTDINO_TOKEN: ${{ (inputs.target || vars.RERUN_E2E_TARGET || 'staging') == 'local' && secrets.TESTDINO_TOKEN_LOCAL || secrets.TESTDINO_STAGING_TOKEN }}
+      TESTDINO_CI_RUN_ID: gh-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.ci }}
+      RERUN_E2E_MODE: ${{ inputs.mode }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.testdino_rerun_sha || github.sha }}
+      # A pin that silently failed to apply looks exactly like a same-commit re-run.
+      - name: Assert the pin took effect
+        env:
+          WANT: ${{ inputs.testdino_rerun_sha }}
+          TIP: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          head=$(git rev-parse HEAD)
+          echo "checked out $head, branch tip $TIP, pin '${WANT}'"
+          if [ -n "$WANT" ]; then
+            [ "$head" = "$WANT" ] || { echo "::error::pin did not apply: got $head, wanted $WANT"; exit 1; }
+          else
+            [ "$head" = "$TIP" ] || { echo "::error::expected the branch tip $TIP, got $head"; exit 1; }
+          fi
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --prefer-offline --no-audit --no-fund
+      - name: Run tests
+        shell: bash
+        env:
+          TD_RERUN_FROM: ${{ inputs.testdino_rerun_from }}
+          TD_RERUN_SCOPE: ${{ inputs.testdino_rerun_scope }}
+          TD_RERUN_TEST_IDS: ${{ inputs.testdino_rerun_test_ids }}
+          TD_RERUN_EXCLUDE_IDS: ${{ inputs.testdino_rerun_exclude_ids }}
+          TD_RERUN_TAGS: ${{ inputs.testdino_rerun_tags }}
+          LEG_GREP: ${{ matrix.grep }}
+          LEG_SHARD: ${{ matrix.shard }}
+          LEG_SPLIT: ${{ matrix.split }}
+          SPLIT_ID: gh-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          if [ -n "$TD_RERUN_FROM" ]; then
+            args=(--rerun "${TD_RERUN_SCOPE:-failed}" --from-run "$TD_RERUN_FROM")
+            if [ -n "$TD_RERUN_TEST_IDS" ]; then
+              args+=(--test-ids "$TD_RERUN_TEST_IDS")
+            fi
+            if [ -n "$TD_RERUN_EXCLUDE_IDS" ]; then
+              args+=(--exclude-ids "$TD_RERUN_EXCLUDE_IDS")
+            fi
+            if [ -n "$TD_RERUN_TAGS" ]; then
+              args+=(--rerun-tags "$TD_RERUN_TAGS")
+            fi
+          else
+            args=(--project=api -g "$LEG_GREP")
+            if [ -n "$LEG_SHARD" ]; then
+              args+=("--shard=$LEG_SHARD")
+            fi
+            if [ -n "$LEG_SPLIT" ]; then
+              args=(--split "$LEG_SPLIT" --split-id "$SPLIT_ID" "${args[@]}")
+            fi
+          fi
+          echo "tdpw $(npx tdpw --version | tail -1)"
+          npx tdpw test "${args[@]}"
+      - name: Fail after the tests
+        if: inputs.mode == 'nontest-fail' && inputs.testdino_rerun_from == ''
+        run: exit 1

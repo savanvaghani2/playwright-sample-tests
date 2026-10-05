@@ -1,0 +1,100 @@
+name: Re-run e2e (no YAML change)
+
+# The customer shape for the in-run re-run: `npx tdpw test`, no testdino_rerun_*
+# inputs. TestDino re-runs this as a new attempt of the same GitHub run and the
+# CLI narrows each retried job to its failures. docs/RERUN_E2E_TEST_PLAN.md §5.1.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: TestDino stack the runner reports to
+        type: choice
+        options: [staging, local]
+        default: staging
+      shape:
+        type: choice
+        options: [single, sharded, split, reporter-only]
+        default: single
+      mode:
+        description: Probe outcomes (tests/rerun-e2e.spec.js)
+        type: choice
+        options: [mixed, recover-only, flaky-only, nontest-fail]
+        default: mixed
+      cli:
+        description: vendored = package.json (2.7.8); 2.7.6 = published, no narrowing
+        type: choice
+        options: [vendored, "2.7.6"]
+        default: vendored
+
+jobs:
+  plan:
+    runs-on: [self-hosted, "testdino-${{ inputs.target == 'local' && 'local' || 'stg' }}"]
+    outputs:
+      legs: ${{ steps.legs.outputs.legs }}
+    steps:
+      - id: legs
+        env:
+          SHAPE: ${{ inputs.shape }}
+        run: |
+          case "$SHAPE" in
+            single)        legs='[{"name":"single","ci":"1","grep":"@rerun-e2e"}]' ;;
+            sharded)       legs='[{"name":"shard 1/4","ci":"1","grep":"@rerun-e2e","shard":"1/4"},{"name":"shard 2/4","ci":"1","grep":"@rerun-e2e","shard":"2/4"},{"name":"shard 3/4","ci":"1","grep":"@rerun-e2e","shard":"3/4"},{"name":"shard 4/4","ci":"1","grep":"@rerun-e2e","shard":"4/4"}]' ;;
+            split)         legs='[{"name":"split 1/3","ci":"1","split":"1/3","grep":"flaky-a|pass-[12]"},{"name":"split 2/3 shard 1/2","ci":"2","split":"2/3","shard":"1/2","grep":"recover|sticky|pass-[345]"},{"name":"split 2/3 shard 2/2","ci":"2","split":"2/3","shard":"2/2","grep":"recover|sticky|pass-[345]"},{"name":"split 3/3","ci":"3","split":"3/3","grep":"pass-[678]"}]' ;;
+            reporter-only) legs='[{"name":"reporter-only","ci":"1","grep":"@rerun-e2e","runner":"playwright"}]' ;;
+            *) echo "::error::unknown shape $SHAPE"; exit 1 ;;
+          esac
+          echo "legs=$legs" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: plan
+    name: ${{ matrix.name }}
+    runs-on: [self-hosted, "testdino-${{ inputs.target == 'local' && 'local' || 'stg' }}"]
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.legs) }}
+    env:
+      TD_ENV: ${{ inputs.target }}
+      TESTDINO_SERVER_URL: ${{ inputs.target == 'local' && 'http://localhost:3005' || secrets.TESTDINO_STAGING_URL }}
+      TESTDINO_TOKEN: ${{ inputs.target == 'local' && secrets.TESTDINO_TOKEN_LOCAL || secrets.TESTDINO_STAGING_TOKEN }}
+      # Every leg of one attempt shares the id, so shards merge; the attempt keeps retries apart.
+      TESTDINO_CI_RUN_ID: gh-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.ci }}
+      RERUN_E2E_MODE: ${{ inputs.mode }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --prefer-offline --no-audit --no-fund
+      - name: Use the published tdpw 2.7.6
+        if: inputs.cli == '2.7.6'
+        run: npm install --no-save --no-audit --no-fund @testdino/playwright@2.7.6
+      - name: Run tests
+        shell: bash
+        env:
+          LEG_GREP: ${{ matrix.grep }}
+          LEG_SHARD: ${{ matrix.shard }}
+          LEG_SPLIT: ${{ matrix.split }}
+          LEG_RUNNER: ${{ matrix.runner }}
+          SPLIT_ID: gh-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          args=(--project=api -g "$LEG_GREP")
+          if [ -n "$LEG_SHARD" ]; then
+            args+=("--shard=$LEG_SHARD")
+          fi
+          if [ "$LEG_RUNNER" = "playwright" ]; then
+            npx playwright test "${args[@]}"
+            exit
+          fi
+          if [ -n "$LEG_SPLIT" ]; then
+            args=(--split "$LEG_SPLIT" --split-id "$SPLIT_ID" "${args[@]}")
+          fi
+          echo "tdpw $(npx tdpw --version | tail -1)"
+          npx tdpw test "${args[@]}"
+      - name: Fail after the tests
+        if: inputs.mode == 'nontest-fail'
+        run: exit 1

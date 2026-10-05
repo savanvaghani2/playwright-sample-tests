@@ -68,7 +68,8 @@ export default defineConfig({
     timeout: 10 * 1000,
   },
 
-  reporter: [
+  // A --list run executes nothing; reporting it opens an empty run on TestDino that never completes.
+  reporter: process.argv.includes('--list') ? [['list']] : [
     [
       '@testdino/playwright',
       {
