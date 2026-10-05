@@ -51,7 +51,7 @@ In-run **narrows** only when the source run's `launcher = tdpw` and `reporterVer
 | `td-local` | `self-hosted, macOS, testdino-local` | `~/actions-runners/local` | `http://localhost:3005` (local docker stack built from `staging`) | existing `testdino-rerun-local.yml`, `testdino-orchestrate-staging.yml`, new `rerun-e2e-*.yml` when `target=local` |
 | `td-stg` | `self-hosted, macOS, testdino-stg` | `~/actions-runners/staging` | `https://stg-analytics.testdino.com` | new `rerun-e2e-*.yml` when `target=staging` |
 
-One runner each means a 4-shard matrix runs its jobs **one after another**. Narrowing and grouping are unaffected; only wall time grows. Register a second instance of a label later if that hurts.
+Exactly two runners, never more. Shard jobs on one runner run **one after another**, so shards stay at 2 and every job stays near 20 s: a gap over 30 s between shards trips ingestion's partial-shard finalize (`partialGroupGrace`) and splits the run.
 
 Setup per runner (registration token via `gh api -X POST repos/savanvaghani2/playwright-sample-tests/actions/runners/registration-token`):
 
@@ -80,13 +80,13 @@ mkdir -p ~/actions-runners/<local|staging> && cd $_
    - `recover-*`: fail when `GITHUB_RUN_ATTEMPT == 1`, pass after. **Proves the check turns green.**
    - `sticky-*`: always fail. **Proves attempt k+2 narrows off attempt k+1.**
    - `flaky-*`: fail on `testInfo.retry == 0`, pass on retry 1 (config `retries: 1`).
-   - Spread so that with `--shard=x/4` failures land in **shards 2 and 3 only**. Confirm with `npx playwright test --list --shard=x/4 --grep @rerun-e2e` before the first run.
+   - Spread so that with `--shard=x/2` shard 1 is green (holds `flaky-a`) and every failure lands in **shard 2**. Confirm with `npx playwright test --list --shard=x/2 --grep @rerun-e2e` before the first run.
    - Mode switches by env: `RERUN_E2E_MODE=flaky-only` (no fail, only flaky), `nontest-fail` (tests pass, a later step exits 1).
 2. `temp-cli/testdino-playwright-2.7.8.tgz` built from PR #62 head + `package.json` `"@testdino/playwright": "file:temp-cli/testdino-playwright-2.7.8.tgz"` on a branch. The old-CLI scenarios check out a commit pinned to `2.7.6`.
 3. `.github/workflows/rerun-e2e-plain.yml`: **"no YAML change" family.** `workflow_dispatch` inputs `target` (local|staging), `shape` (single|sharded|split|reporter-only), `mode`. **No `testdino_rerun_*` inputs.** `runs-on: [self-hosted, testdino-${{ inputs.target }}]`. Jobs per shape:
    - `single`: one job, `npx tdpw test --project=api --grep @rerun-e2e`.
-   - `sharded`: matrix 4, `--shard=${i}/4`, `fail-fast: false`.
-   - `split`: 3 legs sharing `--split-id`, leg 2 sharded 2-way (mirrors `testdino-split-staging.yml`).
+   - `sharded`: matrix 2, `--shard=${i}/2`, `fail-fast: false`.
+   - `split`: 3 jobs sharing `--split-id`: split 1/2 unsharded (green), split 2/2 sharded 2-way (shard 1 red, shard 2 green).
    - `reporter-only`: one job, `npx playwright test` with the reporter from config (no `tdpw`).
 4. `.github/workflows/rerun-e2e-yaml.yml`: **"with YAML change" family.** Same shapes plus the SoT §6.3 inputs, `actions/checkout` `ref: ${{ inputs.testdino_rerun_sha || github.sha }}`, env-not-`${{ }}` in `run:`. When `testdino_rerun_from` is set it runs **one unsharded job**, because `--rerun` refuses `--shard`/`--split` (SoT D17).
 5. Both files merged to **`main`**. `rerun-targets` reads the workflow list from the default branch registry (SoT D9), so a workflow only on a feature branch is never offered.
@@ -103,8 +103,8 @@ Columns: **Src** = source run shape. **YAML** = plain (no change) / yaml (inputs
 |---|---|---|---|---|
 | P1 | single | 2.7.8 | This commit, failed | Sheet: "only the failed tests". GitHub attempt 2 re-runs the one job; it runs only `recover-*` + `sticky-*`; `recover` pass, `sticky` fail; new TestDino run `rerun_of` = source, `ci_attempt=2` |
 | P2 | P1's attempt 2 | 2.7.8 | This commit, failed (on the attempt-2 run) | attempt 3 runs only `sticky-*` (latest outcomes come from attempt 2, D28) |
-| P3 | sharded 4 | 2.7.8 | This commit, failed | Only shard jobs 2 and 3 re-run; each runs only its own failures; reports shard 2/4, 3/4; both group into one run "attempt 2"; finalize within seconds (relay) |
-| P4 | sharded 4, `recover-*` only | 2.7.8 | This commit | Check turns **green** on the original GitHub run |
+| P3 | sharded 2 | 2.7.8 | This commit, failed | Only shard job 2 re-runs and runs only its failures; reports shard 2/2 as one re-run linked to the source; finalize within seconds (relay) |
+| P4 | sharded 2, `recover-*` only | 2.7.8 | This commit | Check turns **green** on the original GitHub run |
 | P5 | split (2 unsharded + 1 sharded leg) | 2.7.8 | This commit, failed | Each failed leg lists its own share and runs its failures; re-run group carries `rerun_of` even when a leg with no failures arrives first (`0e980ea9`) |
 | P6 | single | **2.7.6** | This commit | Sheet: "Every test runs again… update to 2.7.7"; job re-runs **in full**; button reads "Re-run failed jobs" |
 | P7 | split | **2.7.7** (if a tarball exists, else skip) | This commit | Sheet holds split to 2.7.8: runs in full |
@@ -124,7 +124,7 @@ Columns: **Src** = source run shape. **YAML** = plain (no change) / yaml (inputs
 | Y4 | single | flaky only | Dispatch (in-run ineligible); `testdino_rerun_scope=flaky`; only `flaky-*` run |
 | Y5 | single | custom: untick one `sticky` | Dispatch with `testdino_rerun_exclude_ids`; This commit pins `testdino_rerun_sha`; the job asserts checkout SHA == source SHA |
 | Y6 | single | custom: pick 2 | Dispatch with `testdino_rerun_test_ids`; exactly 2 run |
-| Y7 | sharded 4 | Latest | One **unsharded** dispatched job runs all failures from shards 2+3 |
+| Y7 | sharded 2 | Latest | One **unsharded** dispatched job runs all failures from shard 2 |
 | Y8 | split | Latest | One unsharded job; `rerun_of` = the split group run |
 | Y9 | single | Latest with extra tags | `testdino_rerun_tags` reaches `--rerun-tags`; the re-run carries source tags + extra |
 | Y10 | any | CLI direct on the runner: `--rerun failed --from-run <id>`, then `--rerun failed --shard=1/2` | First runs the failures; second refused before any network call (D17) |

@@ -39,8 +39,8 @@ jobs:
         run: |
           case "$SHAPE" in
             single)        legs='[{"name":"single","ci":"1","grep":"@rerun-e2e"}]' ;;
-            sharded)       legs='[{"name":"shard 1/4","ci":"1","grep":"@rerun-e2e","shard":"1/4"},{"name":"shard 2/4","ci":"1","grep":"@rerun-e2e","shard":"2/4"},{"name":"shard 3/4","ci":"1","grep":"@rerun-e2e","shard":"3/4"},{"name":"shard 4/4","ci":"1","grep":"@rerun-e2e","shard":"4/4"}]' ;;
-            split)         legs='[{"name":"split 1/3","ci":"1","split":"1/3","grep":"flaky-a|pass-[12]"},{"name":"split 2/3 shard 1/2","ci":"2","split":"2/3","shard":"1/2","grep":"recover|sticky|pass-[345]"},{"name":"split 2/3 shard 2/2","ci":"2","split":"2/3","shard":"2/2","grep":"recover|sticky|pass-[345]"},{"name":"split 3/3","ci":"3","split":"3/3","grep":"pass-[678]"}]' ;;
+            sharded)       legs='[{"name":"shard 1/2","ci":"1","grep":"@rerun-e2e","shard":"1/2"},{"name":"shard 2/2","ci":"1","grep":"@rerun-e2e","shard":"2/2"}]' ;;
+            split)         legs='[{"name":"split 1/2","ci":"1","split":"1/2","grep":"flaky-a|pass-[1-5]"},{"name":"split 2/2 shard 1/2","ci":"2","split":"2/2","shard":"1/2","grep":"recover|sticky|pass-[678]"},{"name":"split 2/2 shard 2/2","ci":"2","split":"2/2","shard":"2/2","grep":"recover|sticky|pass-[678]"}]' ;;
             reporter-only) legs='[{"name":"reporter-only","ci":"1","grep":"@rerun-e2e","runner":"playwright"}]' ;;
             *) echo "::error::unknown shape $SHAPE"; exit 1 ;;
           esac
